@@ -17,10 +17,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -75,6 +75,9 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
+		if err := l.drainMailbox(); err != nil {
+			return Failed, err
+		}
 		msgs, err := session.BuildContext(l.Log, l.Budget)
 		if err != nil {
 			return Failed, err
@@ -105,7 +108,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
 
 		// Guard: repetition / no-progress / caps.
@@ -148,6 +151,29 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	}
 	l.Log.Append("turn/end", map[string]any{"reason": "aborted", "detail": "MaxSteps exceeded"})
 	return Aborted, errors.New("agent: step budget exhausted")
+}
+
+// drainMailbox injects every undelivered notice into the model-visible
+// stream. Notices are marked delivered BEFORE the inject event lands:
+// a crash between them replays a duplicate next resume instead of a
+// silently lost notice (#13656's mid-turn half — posting was durable,
+// but nothing consumed it until the next user turn).
+func (l *Loop) drainMailbox() error {
+	pending, err := Pending(l.Log)
+	if err != nil || len(pending) == 0 {
+		return err
+	}
+	arr := make([]map[string]any, 0, len(pending))
+	for _, n := range pending {
+		if err := Delivered(l.Log, n.ID); err != nil {
+			return err
+		}
+		arr = append(arr, map[string]any{
+			"from": n.From, "kind": n.Kind, "payload": n.Payload,
+		})
+	}
+	_, err = l.Log.Append("mailbox/inject", map[string]any{"notices": arr})
+	return err
 }
 
 func contentText(c any) string {

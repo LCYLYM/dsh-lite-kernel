@@ -11,11 +11,11 @@ import (
 // noticed because step success only checked "was there an assistant
 // message" (deepseek-harness discussions #13659, #13638).
 type Guard struct {
-	MaxSteps          int // steps allowed in one turn
-	MaxZeroToolSteps  int // consecutive steps with no tool call allowed
-	RepeatWindow      int // trailing chars inspected for n-gram spam
-	RepeatThreshold   int // repeats of the same short n-gram that trigger abort
-	MaxOutputChars    int // per-step visible-output cap
+	MaxSteps         int // steps allowed in one turn
+	MaxZeroToolSteps int // consecutive steps with no tool call allowed
+	RepeatWindow     int // trailing chars inspected for n-gram spam
+	RepeatThreshold  int // repeats of the same short n-gram that trigger abort
+	MaxOutputChars   int // per-step visible-output cap
 }
 
 func DefaultGuard() Guard {

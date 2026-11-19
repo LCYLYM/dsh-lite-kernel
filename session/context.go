@@ -2,6 +2,8 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
 )
@@ -81,6 +83,22 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 				continue
 			}
 			m = llm.Message{Role: "tool", Content: me.Content, ToolCallID: me.ToolCallID}
+		case "mailbox/inject":
+			var inj struct {
+				Notices []struct {
+					From    string          `json:"from"`
+					Kind    string          `json:"kind"`
+					Payload json.RawMessage `json:"payload"`
+				} `json:"notices"`
+			}
+			if err := json.Unmarshal(ev.Data, &inj); err != nil || len(inj.Notices) == 0 {
+				continue
+			}
+			var sb strings.Builder
+			for _, n := range inj.Notices {
+				fmt.Fprintf(&sb, "[mailbox notice from %s (%s)] %s\n", n.From, n.Kind, n.Payload)
+			}
+			m = llm.Message{Role: "user", Content: strings.TrimRight(sb.String(), "\n")}
 		default:
 			continue
 		}

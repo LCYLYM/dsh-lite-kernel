@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -138,5 +139,49 @@ func TestMailboxDurableReplay(t *testing.T) {
 	pend, _ = Pending(lg2)
 	if len(pend) != 0 {
 		t.Fatal("notice not acked")
+	}
+}
+
+// capProvider records the message list it is asked to complete.
+type capProvider struct{ msgs []llm.Message }
+
+func (p *capProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	p.msgs = append([]llm.Message(nil), r.Messages...)
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestMailboxNoticesReachNextRequest(t *testing.T) {
+	prov := &capProvider{}
+	loop, lg := newLoop(t, prov)
+	if err := Post(lg, Notice{ID: "n1", From: "child-1", Kind: "done",
+		Payload: json.RawMessage(`{"result":42}`)}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loop.Run(context.Background(), "hello")
+	if err != nil || state != Completed {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	found := false
+	for _, m := range prov.msgs {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice from child-1") && strings.Contains(s, `"result":42`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("notice never reached the model request")
+	}
+	if p, _ := Pending(lg); len(p) != 0 {
+		t.Fatal("notice left pending")
+	}
+	// replay on resume injects nothing new — delivered is durable
+	msgs2, _ := session.BuildContext(lg, loop.Budget)
+	seen := 0
+	for _, m := range msgs2 {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice") {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("expected exactly one injected notice, got %d", seen)
 	}
 }
