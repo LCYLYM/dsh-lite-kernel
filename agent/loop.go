@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
 	"github.com/LCYLYM/dsh-lite-kernel/session"
@@ -17,10 +18,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -105,7 +106,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
 
 		// Guard: repetition / no-progress / caps.
@@ -129,6 +130,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			if terr != nil {
 				out = map[string]any{"error": terr.Error()}
 			}
+			out = l.capResult(out)
 			l.Log.Append("tool/result", map[string]any{
 				"tool_call_id": tc.ID, "name": tc.Name, "content": out, "error": terr != nil,
 			})
@@ -148,6 +150,27 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	}
 	l.Log.Append("turn/end", map[string]any{"reason": "aborted", "detail": "MaxSteps exceeded"})
 	return Aborted, errors.New("agent: step budget exhausted")
+}
+
+// capResult truncates an oversized tool result before it lands in the
+// log — a single runaway tool must not dump unbounded bytes into the
+// durable stream (and from there into every later context). The marker
+// keeps the truncation model-visible.
+func (l *Loop) capResult(out any) any {
+	max := l.Guard.MaxToolResultChars
+	if max <= 0 {
+		return out
+	}
+	b, err := json.Marshal(out)
+	if err != nil || utf8.RuneCount(b) <= max {
+		return out
+	}
+	runes := []rune(string(b))
+	return map[string]any{
+		"truncated":   true,
+		"total_chars": utf8.RuneCount(b),
+		"content":     string(runes[:max]),
+	}
 }
 
 func contentText(c any) string {
