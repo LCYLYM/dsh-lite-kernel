@@ -95,3 +95,28 @@ func TestEditFileConcurrent(t *testing.T) {
 		t.Fatalf("lost update: %q", got)
 	}
 }
+
+func TestWriteFileReplacesLinkNotTarget(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "real.txt"), []byte("original"), 0o644)
+	os.Symlink("real.txt", filepath.Join(dir, "link.txt"))
+	raw, _ := json.Marshal(map[string]any{"path": "link.txt", "content": "new"})
+	if _, err := (WriteFile{W: Workspace{Root: dir}}).Call(context.Background(), raw); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "real.txt"))
+	if string(got) != "original" {
+		t.Fatalf("write destroyed link target: %q", got)
+	}
+	if fi, _ := os.Lstat(filepath.Join(dir, "link.txt")); fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("link should have been replaced by a regular file")
+	}
+}
+
+func TestWriteFileInitializesMissingWorkspace(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "fresh", "ws")
+	raw, _ := json.Marshal(map[string]any{"path": "a.txt", "content": "x"})
+	if _, err := (WriteFile{W: Workspace{Root: dir}}).Call(context.Background(), raw); err != nil {
+		t.Fatalf("first write in new workspace: %v", err)
+	}
+}

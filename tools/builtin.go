@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Workspace confines all file tools to Root.
@@ -29,64 +30,92 @@ func lockPath(p string) func() {
 	return m.Unlock
 }
 
-func (w Workspace) resolve(p string) (string, error) {
+// resolve returns both forms of p: the lexical absolute path (what
+// write_file should create — a symlink there is REPLACED, never
+// followed) and the real path with symlinks resolved (what
+// read_file/edit_file should touch — an in-workspace link to an
+// external file is rejected).
+func (w Workspace) resolve(p string) (lex string, real string, err error) {
 	clean := filepath.Clean(filepath.Join(w.Root, p))
 	abs, err := filepath.Abs(clean)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	rootAbs, _ := filepath.Abs(w.Root)
 	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(os.PathSeparator)) {
-		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
+		return "", "", fmt.Errorf("tools: path %q escapes the workspace", p)
 	}
-	// Lexical containment isn't enough: a symlink inside the workspace
-	// would redirect file ops outside. Resolve the real path of the
-	// deepest existing ancestor and re-check containment on it.
+	lexAbs := abs
+	// A missing workspace isn't an error — the first write_file call
+	// must be able to initialize it.
+	if _, err := os.Stat(rootAbs); os.IsNotExist(err) {
+		if err := os.MkdirAll(rootAbs, 0o755); err != nil {
+			return "", "", err
+		}
+	}
 	rootReal, err := filepath.EvalSymlinks(rootAbs)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	probe, rest := abs, ""
 	for {
-		if real, err := filepath.EvalSymlinks(probe); err == nil {
-			abs = filepath.Join(real, rest)
+		if realp, err := filepath.EvalSymlinks(probe); err == nil {
+			abs = filepath.Join(realp, rest)
 			break
 		}
 		parent := filepath.Dir(probe)
 		if parent == probe {
-			return "", fmt.Errorf("tools: path %q unresolvable", p)
+			return "", "", fmt.Errorf("tools: path %q unresolvable", p)
 		}
 		rest = filepath.Join(filepath.Base(probe), rest)
 		probe = parent
 	}
 	if abs != rootReal && !strings.HasPrefix(abs, rootReal+string(os.PathSeparator)) {
-		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
+		return "", "", fmt.Errorf("tools: path %q escapes the workspace", p)
 	}
-	return abs, nil
+	return lexAbs, abs, nil
 }
 
 // writeAtomic writes data to a unique temp file next to p and renames —
-// a failed write can never leave p truncated.
-func writeAtomic(p string, data []byte, mode os.FileMode) error {
+// a failed write can never leave p truncated, and the temp is removed
+// when the rename fails. preserve, when non-nil, keeps the original
+// file's uid/gid/mode; without it the file gets mode + caller's ids.
+// A chown failure fails the write loudly rather than exposing content
+// to a different group with the original's permission bits.
+func writeAtomic(p string, data []byte, mode os.FileMode, preserve os.FileInfo) error {
 	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
 	if err != nil {
 		return err
 	}
-	if err := tmp.Chmod(mode); err != nil {
+	cleanup := func(err error) error {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return err
 	}
+	if preserve != nil {
+		st, ok := preserve.Sys().(*syscall.Stat_t)
+		if !ok {
+			return cleanup(fmt.Errorf("tools: cannot stat %q", p))
+		}
+		if err := tmp.Chown(int(st.Uid), int(st.Gid)); err != nil {
+			return cleanup(fmt.Errorf("tools: cannot preserve ownership of %q: %w", p, err))
+		}
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		return cleanup(err)
+	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return err
+		return cleanup(err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmp.Name())
 		return err
 	}
-	return os.Rename(tmp.Name(), p)
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
 }
 
 // ReadFile reads a file inside the workspace.
@@ -104,7 +133,7 @@ func (t ReadFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, err
 	}
-	p, err := t.W.resolve(a.Path)
+	_, p, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +163,10 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, err
 	}
-	p, err := t.W.resolve(a.Path)
+	// resolve rejects symlink escapes; then we write the LEXICAL path —
+	// a symlink destination is replaced by the new file, so writing a
+	// link never destroys the file it points to.
+	p, _, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +175,7 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
 	}
-	if err := writeAtomic(p, []byte(a.Content), 0o600); err != nil {
+	if err := writeAtomic(p, []byte(a.Content), 0o600, nil); err != nil {
 		return nil, err
 	}
 	return map[string]any{"path": p}, nil

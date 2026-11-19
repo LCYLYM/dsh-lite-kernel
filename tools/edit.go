@@ -38,7 +38,7 @@ func (t EditFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if a.Old == "" {
 		return nil, fmt.Errorf("tools: edit_file requires a non-empty 'old'")
 	}
-	p, err := t.W.resolve(a.Path)
+	_, p, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +69,7 @@ func (t EditFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 		n = 1
 	}
 	out := strings.Replace(string(src), a.Old, a.New, n)
-	if err := writeAtomic(p, []byte(out), info.Mode()); err != nil {
+	if err := writeAtomic(p, []byte(out), info.Mode(), info); err != nil {
 		return nil, err
 	}
 	return map[string]any{"replaced": n}, nil
