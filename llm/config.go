@@ -38,8 +38,8 @@ func (p Profile) Resolve() (Provider, string, error) {
 			return nil, "", fmt.Errorf("llm: profile for %q missing API key", p.Model)
 		}
 		u, err := url.Parse(p.BaseURL)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return nil, "", fmt.Errorf("llm: profile for %q has malformed base URL %q", p.Model, p.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, "", fmt.Errorf("llm: profile for %q has non-HTTP(S) or malformed base URL %q", p.Model, p.BaseURL)
 		}
 		to := p.Timeout
 		if to <= 0 {
