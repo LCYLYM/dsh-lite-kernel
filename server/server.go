@@ -12,6 +12,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -212,5 +213,9 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeErr(w http.ResponseWriter, err error) {
-	http.Error(w, err.Error(), http.StatusInternalServerError)
+	status := http.StatusInternalServerError
+	if errors.Is(err, session.ErrNotFound) {
+		status = http.StatusNotFound
+	}
+	http.Error(w, err.Error(), status)
 }

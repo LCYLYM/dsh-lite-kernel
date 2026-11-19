@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 )
 
@@ -81,6 +82,14 @@ func (s *Store) CreateOrReuseBlank(workspace string) (*Session, bool, error) {
 	return ses, false, err
 }
 
+// ErrNotFound marks a missing (or malformed) session id. Handlers map
+// it to 404; every other store error stays a 500.
+var ErrNotFound = errors.New("session: no such session")
+
+// validID whitelists the id charset before it is ever joined into a
+// path — "../../anything" must never reach the filesystem.
+var validID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 // Get returns a live session or loads it from disk.
 func (s *Store) Get(id string) (*Session, error) {
 	s.mu.Lock()
@@ -88,9 +97,12 @@ func (s *Store) Get(id string) (*Session, error) {
 	if ses, ok := s.live[id]; ok {
 		return ses, nil
 	}
+	if !validID.MatchString(id) {
+		return nil, fmt.Errorf("%w %q", ErrNotFound, id)
+	}
 	path := filepath.Join(s.dir, id+".jsonl")
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("session: no such session %q", id)
+		return nil, fmt.Errorf("%w %q", ErrNotFound, id)
 	}
 	lg, err := OpenLog(path)
 	if err != nil {
