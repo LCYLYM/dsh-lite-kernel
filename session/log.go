@@ -95,6 +95,27 @@ func OpenLog(path string) (*Log, error) {
 		f.Close()
 		return nil, err
 	}
+	// A valid final event that was never newline-terminated (writer
+	// exited between the data and the '\n') is still committed — but
+	// appending now would glue the next event onto its line. Terminate
+	// it so the log stays well-formed.
+	if size > 0 {
+		if _, err := f.Seek(-1, 2); err != nil {
+			f.Close()
+			return nil, err
+		}
+		var last [1]byte
+		if _, err := f.Read(last[:]); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if last[0] != '\n' {
+			if _, err := f.Write([]byte{'\n'}); err != nil {
+				f.Close()
+				return nil, err
+			}
+		}
+	}
 	return l, nil
 }
 

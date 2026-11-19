@@ -174,3 +174,26 @@ func TestOpenLogCRLFTail(t *testing.T) {
 		t.Fatalf("reopened Len=%d", lg2.Len())
 	}
 }
+
+// A valid final event with no trailing newline is terminated at open —
+// otherwise the next append glues onto its line and corrupts the log.
+func TestOpenLogUnterminatedFinal(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "u.jsonl")
+	os.WriteFile(p, []byte(`{"seq":1,"type":"a","data":{},"ts":"x"}`), 0o600) // no \n
+	lg, err := OpenLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lg.Append("b", nil); err != nil {
+		t.Fatal(err)
+	}
+	lg.Close()
+	lg2, err := OpenLog(p)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if lg2.Len() != 2 {
+		t.Fatalf("Len=%d", lg2.Len())
+	}
+}
