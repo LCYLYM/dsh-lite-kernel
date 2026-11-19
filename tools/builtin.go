@@ -17,13 +17,38 @@ import (
 type Workspace struct{ Root string }
 
 func (w Workspace) resolve(p string) (string, error) {
-	clean := filepath.Clean(filepath.Join(w.Root, p))
-	abs, err := filepath.Abs(clean)
+	abs, err := filepath.Abs(filepath.Clean(filepath.Join(w.Root, p)))
 	if err != nil {
 		return "", err
 	}
-	rootAbs, _ := filepath.Abs(w.Root)
-	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(os.PathSeparator)) {
+	rootReal, err := filepath.EvalSymlinks(w.Root)
+	if err != nil {
+		return "", err
+	}
+	// EvalSymlinks fails on paths that don't exist yet (a new file being
+	// written) — resolve the deepest existing ancestor, which also
+	// resolves any symlink in the middle of the path.
+	var tail []string
+	for {
+		if _, err := os.Lstat(abs); err == nil {
+			real, rerr := filepath.EvalSymlinks(abs)
+			if rerr != nil {
+				return "", rerr
+			}
+			abs = real
+			break
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			return "", fmt.Errorf("tools: cannot resolve %q", p)
+		}
+		tail = append(tail, filepath.Base(abs))
+		abs = parent
+	}
+	for i := len(tail) - 1; i >= 0; i-- {
+		abs = filepath.Join(abs, tail[i])
+	}
+	if abs != rootReal && !strings.HasPrefix(abs, rootReal+string(os.PathSeparator)) {
 		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
 	}
 	return abs, nil
