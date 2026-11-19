@@ -11,10 +11,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // Workspace confines all file tools to Root.
 type Workspace struct{ Root string }
+
+// fileMu serializes read-modify-write and write ops per resolved path —
+// concurrent tool calls must not restore stale snapshots over each
+// other's committed results.
+var fileMu sync.Map // resolved abs path -> *sync.Mutex
+
+func lockPath(p string) func() {
+	mu, _ := fileMu.LoadOrStore(p, &sync.Mutex{})
+	m := mu.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
+}
 
 func (w Workspace) resolve(p string) (string, error) {
 	clean := filepath.Clean(filepath.Join(w.Root, p))
@@ -26,7 +39,54 @@ func (w Workspace) resolve(p string) (string, error) {
 	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(os.PathSeparator)) {
 		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
 	}
+	// Lexical containment isn't enough: a symlink inside the workspace
+	// would redirect file ops outside. Resolve the real path of the
+	// deepest existing ancestor and re-check containment on it.
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", err
+	}
+	probe, rest := abs, ""
+	for {
+		if real, err := filepath.EvalSymlinks(probe); err == nil {
+			abs = filepath.Join(real, rest)
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", fmt.Errorf("tools: path %q unresolvable", p)
+		}
+		rest = filepath.Join(filepath.Base(probe), rest)
+		probe = parent
+	}
+	if abs != rootReal && !strings.HasPrefix(abs, rootReal+string(os.PathSeparator)) {
+		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
+	}
 	return abs, nil
+}
+
+// writeAtomic writes data to a unique temp file next to p and renames —
+// a failed write can never leave p truncated.
+func writeAtomic(p string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), p)
 }
 
 // ReadFile reads a file inside the workspace.
@@ -78,14 +138,15 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	tmp := p + ".tmp"
+	unlock := lockPath(p)
+	defer unlock()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(tmp, []byte(a.Content), 0o600); err != nil {
+	if err := writeAtomic(p, []byte(a.Content), 0o600); err != nil {
 		return nil, err
 	}
-	return map[string]any{"path": p}, os.Rename(tmp, p)
+	return map[string]any{"path": p}, nil
 }
 
 // Echo returns its input — the smoke-test tool.

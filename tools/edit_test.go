@@ -57,3 +57,41 @@ func TestEditFileGuards(t *testing.T) {
 		t.Fatal("workspace escape accepted")
 	}
 }
+
+func TestEditFileSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "ext.txt")
+	os.WriteFile(target, []byte("alpha"), 0o644)
+	os.Symlink(target, filepath.Join(dir, "link.txt"))
+	if _, err := editCall(t, dir, map[string]any{"path": "link.txt", "old": "alpha", "new": "beta"}); err == nil {
+		t.Fatal("symlink edit escaped the workspace")
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != "alpha" {
+		t.Fatal("external file modified")
+	}
+}
+
+func TestEditFileConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("alpha beta"), 0o644)
+	done := make(chan error, 2)
+	go func() {
+		_, err := editCall(t, dir, map[string]any{"path": "a.txt", "old": "alpha", "new": "ALPHA"})
+		done <- err
+	}()
+	go func() {
+		_, err := editCall(t, dir, map[string]any{"path": "a.txt", "old": "beta", "new": "BETA"})
+		done <- err
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "a.txt"))
+	if string(got) != "ALPHA BETA" {
+		t.Fatalf("lost update: %q", got)
+	}
+}

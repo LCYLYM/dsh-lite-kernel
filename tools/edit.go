@@ -42,6 +42,8 @@ func (t EditFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	unlock := lockPath(p)
+	defer unlock()
 	info, err := os.Stat(p)
 	if err != nil {
 		return nil, err
@@ -67,7 +69,7 @@ func (t EditFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 		n = 1
 	}
 	out := strings.Replace(string(src), a.Old, a.New, n)
-	if err := os.WriteFile(p, []byte(out), info.Mode()); err != nil {
+	if err := writeAtomic(p, []byte(out), info.Mode()); err != nil {
 		return nil, err
 	}
 	return map[string]any{"replaced": n}, nil
