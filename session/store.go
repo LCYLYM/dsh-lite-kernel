@@ -113,6 +113,22 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
+// Release evicts a session from the live map and closes its log. The
+// session reloads on the next Get — live memory should track working
+// sessions, not every session ever touched.
+func (s *Store) Release(id string) error {
+	s.mu.Lock()
+	ses, ok := s.live[id]
+	if ok {
+		delete(s.live, id)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return ses.Log.Close()
+}
+
 // List returns live session ids (a lock-held snapshot, never a stale copy).
 func (s *Store) List() []string {
 	s.mu.Lock()

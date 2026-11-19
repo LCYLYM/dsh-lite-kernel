@@ -109,3 +109,24 @@ func TestRetryMarkerSkipped(t *testing.T) {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
 	}
 }
+
+func TestReleaseReloads(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ses, _ := st.Create("ws")
+	if err := st.Release(ses.ID); err != nil {
+		t.Fatal(err)
+	}
+	// evicted: List drops it, Get reloads a fresh Session object
+	for _, id := range st.List() {
+		if id == ses.ID {
+			t.Fatal("released session still live")
+		}
+	}
+	ses2, err := st.Get(ses.ID)
+	if err != nil || ses2 == ses {
+		t.Fatalf("reload: %v same=%v", err, ses2 == ses)
+	}
+}
