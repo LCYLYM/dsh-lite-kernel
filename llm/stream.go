@@ -25,12 +25,6 @@ type Streamer interface {
 	Stream(ctx context.Context, req *Request, delta func(Delta) error) (*Response, error)
 }
 
-// streamRequest is the OpenAI-compatible streaming wire shape.
-type streamRequest struct {
-	openaiRequest
-	Stream bool `json:"stream"`
-}
-
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
@@ -51,7 +45,7 @@ type streamChunk struct {
 
 // Stream implements Streamer for OpenAI-compatible endpoints.
 func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, delta func(Delta) error) (*Response, error) {
-	or := openaiRequest{Model: req.Model, Messages: req.Messages, MaxTokens: req.MaxTokens, Temperature: req.Temperature}
+	or := openaiRequest{Model: req.Model, Messages: wireMessages(req.Messages), MaxTokens: req.MaxTokens, Temperature: req.Temperature}
 	for _, t := range req.Tools {
 		var ts toolSpec
 		ts.Type = "function"
@@ -60,7 +54,8 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, delta func(De
 		ts.Function.Parameters = t.Schema
 		or.Tools = append(or.Tools, ts)
 	}
-	payload, err := json.Marshal(streamRequest{or, true})
+	or.Stream = true
+	payload, err := json.Marshal(or)
 	if err != nil {
 		return nil, err
 	}
@@ -158,8 +153,10 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, delta func(De
 			ID: b.id, Name: b.name, Args: json.RawMessage(b.args.String()),
 		})
 	}
+	// A stream that ends before any finish_reason was truncated by the
+	// transport — the partial answer must not be committed as complete.
 	if out.FinishReason == "" {
-		out.FinishReason = "stop"
+		return nil, &CallError{Kind: KindTransient, Message: "llm: stream ended before finish_reason"}
 	}
 	return out, nil
 }
