@@ -159,9 +159,9 @@ func TestSessionTokenBudgetAborts(t *testing.T) {
 	prov := &meterProvider{}
 	loop, lg := newLoop(t, prov)
 	loop.Guard.MaxSessionTokens = 120 // first call spends 150
-	// The turn that crossed the cap still completes its paid work…
+	// The step that crossed the cap aborts before tool side effects.
 	state, err := loop.Run(context.Background(), "hi")
-	if state != Completed || err != nil {
+	if state != Aborted || err == nil {
 		t.Fatalf("state=%s err=%v", state, err)
 	}
 	u := session.Usage(lg)
