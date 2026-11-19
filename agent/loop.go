@@ -17,10 +17,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -81,12 +81,26 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		}
 		var resp *llm.Response
 		err = l.Retry.Do(ctx, func(c context.Context) error {
+			// A stalled provider call must not park the turn until the
+			// caller's outer deadline (#13621 frozen turns): bound each
+			// attempt, let Retry decide whether to take another.
+			if l.Guard.CallTimeout > 0 {
+				var cancel context.CancelFunc
+				c, cancel = context.WithTimeout(c, time.Duration(l.Guard.CallTimeout)*time.Second)
+				defer cancel()
+			}
 			var e error
 			resp, e = l.Provider.Complete(c, &llm.Request{
 				Model:    l.Model,
 				Messages: msgs,
 				Tools:    l.Registry.Specs(),
 			})
+			// A per-attempt deadline surfaced raw is a classified timeout
+			// — retryable, not an opaque turn failure.
+			if e != nil && c.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+				return &llm.CallError{Kind: llm.KindTimeout,
+					Message: fmt.Sprintf("provider call exceeded %ds", l.Guard.CallTimeout)}
+			}
 			return e
 		})
 		if err != nil {
@@ -105,7 +119,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
 
 		// Guard: repetition / no-progress / caps.
