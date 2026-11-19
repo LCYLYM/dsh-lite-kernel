@@ -42,11 +42,18 @@ for d in bin lib lib32 lib64 libx32 usr etc sbin opt; do
 done
 for d in /*; do
   case "$d" in
-    /bin|/lib|/lib32|/lib64|/libx32|/usr|/etc|/sbin|/opt|/dev|/proc|/mnt) ;;
+    /bin|/lib|/lib32|/lib64|/libx32|/usr|/etc|/sbin|/opt|/proc|/mnt|/tmp|/dev) ;;
     *) mount -t tmpfs -o ro,size=1m tmpfs "$d" 2>/dev/null || : ;;
   esac
 done
-mount -t tmpfs -o size=4m tmpfs /dev/shm 2>/dev/null || :
+# Fresh /dev: device opens are denied in a userns anyway (the kernel
+# checks CAP_MKNOD against the superblock's userns), so neither binds
+# nor mknod can give working nodes — plain files cover the common
+# uses: >/dev/null sinks (bounded by the 4m tmpfs), reads get EOF.
+mount -t tmpfs -o size=4m tmpfs /dev
+for d in null zero full random urandom tty ptmx; do touch "/dev/$d"; done
+mkdir /dev/shm /dev/pts
+mount -t tmpfs -o size=4m tmpfs /dev/shm
 mount -t tmpfs -o size=64m tmpfs /tmp
 exec sh -c 'cd /mnt && exec sh -c "$1"' _ "$CMD"
 `

@@ -71,14 +71,20 @@ func TestShellConfined(t *testing.T) {
 	if strings.TrimSpace(res["output"].(string)) != "" {
 		t.Fatalf("host dirs not covered: %v", res)
 	}
-	// /dev is masked too — only the re-bound safe nodes and shm exist.
+	// /dev is a fresh tmpfs — only our stub files and empty dirs exist;
+	// no host device nodes at all.
 	res = call("ls /dev")
 	for _, line := range strings.Fields(res["output"].(string)) {
 		switch line {
-		case "null", "zero", "urandom", "shm":
+		case "null", "zero", "full", "random", "urandom", "tty", "ptmx", "pts", "shm":
 		default:
 			t.Fatalf("host device %q exposed: %v", line, res)
 		}
+	}
+	// >/dev/null must work — the classic failure mode of this sandbox.
+	res = call("echo out; echo err >&2; echo kept 2>/dev/null")
+	if res["exit_code"] != 0 {
+		t.Fatalf("2>/dev/null broken: %v", res)
 	}
 	// Quote-split words like r""m are just words in a namespace — rm
 	// inside the workspace is legitimate and works.
