@@ -7,8 +7,10 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -46,18 +48,28 @@ func OpenLog(path string) (*Log, error) {
 	if fi != nil {
 		size = fi.Size()
 	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	// ReadBytes keeps raw line endings: offsets, truncation points and the
+	// last-line test all operate on real byte positions — a Scanner would
+	// strip the '\r' of CRLF endings and misplace the truncation cut.
+	r := bufio.NewReaderSize(f, 1<<20)
 	var off int64
-	for sc.Scan() {
-		line := sc.Bytes()
+	for {
+		raw, rerr := r.ReadBytes('\n')
+		if len(raw) == 0 {
+			if rerr != nil && rerr != io.EOF {
+				f.Close()
+				return nil, fmt.Errorf("session: corrupt log %s: %w", path, rerr)
+			}
+			break
+		}
+		line := bytes.TrimRight(raw, "\r\n")
 		var ev Event
 		jerr := json.Unmarshal(line, &ev)
 		switch {
 		case jerr == nil && ev.Seq == l.nextSeq:
 			l.offsets = append(l.offsets, off)
 			l.nextSeq++
-		case jerr != nil && off+int64(len(line))+1 >= size:
+		case jerr != nil && off+int64(len(raw)) >= size:
 			// Unparseable LAST line: a crash mid-append never committed —
 			// drop the uncommitted tail so later appends don't leave the
 			// garbage embedded in the middle of the log.
@@ -65,15 +77,19 @@ func OpenLog(path string) (*Log, error) {
 				f.Close()
 				return nil, err
 			}
+			size = off
 		default:
 			f.Close()
 			return nil, fmt.Errorf("session: corrupt log %s at seq %d", path, l.nextSeq)
 		}
-		off += int64(len(line)) + 1
-	}
-	if err := sc.Err(); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("session: corrupt log %s: %w", path, err)
+		off += int64(len(raw))
+		if rerr != nil {
+			if rerr != io.EOF {
+				f.Close()
+				return nil, fmt.Errorf("session: corrupt log %s: %w", path, rerr)
+			}
+			break
+		}
 	}
 	if _, err := f.Seek(0, 2); err != nil {
 		f.Close()

@@ -147,3 +147,30 @@ func TestOpenLogValidatesSeqs(t *testing.T) {
 		t.Fatal("seq gap accepted")
 	}
 }
+
+// CRLF endings: offsets must count real bytes — a Scanner strips '\r'
+// and would cut the truncation inside a committed event's newline.
+func TestOpenLogCRLFTail(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "crlf.jsonl")
+	os.WriteFile(p, []byte("{\"seq\":1,\"type\":\"a\",\"data\":{},\"ts\":\"x\"}\r\n{\"seq\":"), 0o600)
+	lg, err := OpenLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lg.Len() != 1 {
+		t.Fatalf("Len=%d", lg.Len())
+	}
+	if ev, _ := lg.Append("b", nil); ev.Seq != 2 {
+		t.Fatalf("seq %d", ev.Seq)
+	}
+	lg.Close()
+	// reopen must succeed — the append landed after a clean newline
+	lg2, err := OpenLog(p)
+	if err != nil {
+		t.Fatalf("reopen after CRLF recovery: %v", err)
+	}
+	if lg2.Len() != 2 {
+		t.Fatalf("reopened Len=%d", lg2.Len())
+	}
+}
