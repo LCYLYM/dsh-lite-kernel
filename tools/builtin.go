@@ -30,19 +30,6 @@ func lockPath(p string) func() {
 	return m.Unlock
 }
 
-// lockPaths locks one or two distinct paths in sorted order.
-func lockPaths(a, b string) func() {
-	if a == b {
-		return lockPath(a)
-	}
-	if a > b {
-		a, b = b, a
-	}
-	u1 := lockPath(a)
-	u2 := lockPath(b)
-	return func() { u2(); u1() }
-}
-
 // resolve returns both forms of p: the lexical absolute path (what
 // write_file should create — a symlink there is REPLACED, never
 // followed) and the real path with symlinks resolved (what
@@ -178,16 +165,21 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	// resolve rejects symlink escapes on the leaf; the parent needs the
 	// same check — a dir symlink could make the lexical rename land
 	// outside even when the leaf's target resolves inside.
-	p, real, err := t.W.resolve(a.Path)
+	p, _, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
 	if _, _, err := t.W.resolve(filepath.Dir(a.Path)); err != nil {
 		return nil, err
 	}
-	// Lock lexical and real in stable order — EditFile holds the real
-	// path's lock; both must serialize read-modify-write.
-	unlock := lockPaths(p, real)
+	if rootAbs, _ := filepath.Abs(t.W.Root); p == rootAbs {
+		return nil, fmt.Errorf("tools: path %q is the workspace root", a.Path)
+	}
+	// Lock the lexical path only: the write replaces the dir entry and
+	// never touches the symlink target's contents — locking the real
+	// path would block a replacement on a stuck reader of the target
+	// (e.g. a named pipe).
+	unlock := lockPath(p)
 	defer unlock()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err

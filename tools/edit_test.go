@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func editCall(t *testing.T, dir string, a map[string]any) (any, error) {
@@ -147,5 +149,45 @@ func TestReadOnMissingWorkspaceLeavesNothing(t *testing.T) {
 	}
 	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
 		t.Fatal("read materialized the workspace")
+	}
+}
+
+func TestWriteFileRejectsWorkspaceRoot(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ws")
+	raw, _ := json.Marshal(map[string]any{"path": ".", "content": "x"})
+	if _, err := (WriteFile{W: Workspace{Root: dir}}).Call(context.Background(), raw); err == nil {
+		t.Fatal("writing over the workspace root allowed")
+	}
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Fatal("root write materialized a file")
+	}
+}
+
+func TestWriteFileReplacesLinkToFifo(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(fifo, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{"path": "link", "content": "data"})
+	done := make(chan error, 1)
+	go func() {
+		_, err := (WriteFile{W: Workspace{Root: dir}}).Call(context.Background(), raw)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("link replacement blocked on the fifo")
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "link"))
+	if string(got) != "data" {
+		t.Fatal("link was not replaced")
 	}
 }
