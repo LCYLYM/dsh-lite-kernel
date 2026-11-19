@@ -26,10 +26,15 @@ import (
 
 // Server is the HTTP front end.
 type Server struct {
-	Store    *session.Store
-	Provider llm.Provider
-	Model    string
-	NewLoop  func(ses *session.Session) *agent.Loop
+	Store *session.Store
+	// EventBuf is the live-subscription buffer per stream (default 256);
+	// Heartbeat is the SSE keep-alive interval (default 20s). Both exist
+	// so tests can shrink them.
+	EventBuf  int
+	Heartbeat time.Duration
+	Provider  llm.Provider
+	Model     string
+	NewLoop   func(ses *session.Session) *agent.Loop
 
 	mu    sync.Mutex
 	loops map[string]*agent.Loop
@@ -147,19 +152,41 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	rc := http.NewResponseController(w)
 
-	ch, unsub := ses.Log.Subscribe(256)
+	bufSize := s.EventBuf
+	if bufSize <= 0 {
+		bufSize = 256
+	}
+	ch, unsub := ses.Log.Subscribe(bufSize)
 	defer unsub()
 
+	last := after
+	sendFailed := false
 	send := func(ev session.Event) bool {
+		if sendFailed || ev.Seq <= last {
+			return !sendFailed
+		}
 		data, _ := json.Marshal(ev)
 		// A write deadline: a peer that stops reading is closed instead of
 		// accumulating buffered bytes forever (#13759).
 		_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, data); err != nil {
+			sendFailed = true
 			return false
 		}
 		fl.Flush()
+		last = ev.Seq
 		return true
+	}
+	// fill replays everything after the last sent seq — the subscription
+	// buffer drops events on overflow, but they stay durable in the log.
+	fill := func() bool {
+		if ses.Log.Len() <= last {
+			return true
+		}
+		if err := ses.Log.ReadFrom(last, send); err != nil {
+			return false
+		}
+		return !sendFailed
 	}
 
 	// 1. Replay from the durable log — this is what makes the stream
@@ -167,22 +194,37 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	replayErr := ses.Log.ReadFrom(after, func(ev session.Event) bool {
 		return send(ev)
 	})
-	if replayErr != nil {
+	if replayErr != nil || sendFailed {
 		return
 	}
 
 	// 2. Live tail + heartbeat.
-	heartbeat := time.NewTicker(20 * time.Second)
+	hb := s.Heartbeat
+	if hb <= 0 {
+		hb = 20 * time.Second
+	}
+	heartbeat := time.NewTicker(hb)
 	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case ev, ok := <-ch:
-			if !ok || !send(ev) {
+			if !ok {
+				return
+			}
+			if ev.Seq > last+1 && !fill() {
+				return
+			}
+			if !send(ev) {
 				return
 			}
 		case <-heartbeat.C:
+			// Tail events can be dropped with nothing newer to trigger
+			// the live-path fill — catch up on the heartbeat too.
+			if !fill() {
+				return
+			}
 			_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 			if _, err := fmt.Fprintf(w, ": hb\n\n"); err != nil {
 				return
