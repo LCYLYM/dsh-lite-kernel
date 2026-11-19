@@ -17,41 +17,51 @@ import (
 type Workspace struct{ Root string }
 
 func (w Workspace) resolve(p string) (string, error) {
+	rootAbs, err := filepath.Abs(w.Root)
+	if err != nil {
+		return "", err
+	}
 	abs, err := filepath.Abs(filepath.Clean(filepath.Join(w.Root, p)))
 	if err != nil {
 		return "", err
 	}
-	rootReal, err := filepath.EvalSymlinks(w.Root)
+	rootReal, err := realPath(rootAbs)
 	if err != nil {
 		return "", err
 	}
-	// EvalSymlinks fails on paths that don't exist yet (a new file being
-	// written) — resolve the deepest existing ancestor, which also
-	// resolves any symlink in the middle of the path.
-	var tail []string
-	for {
-		if _, err := os.Lstat(abs); err == nil {
-			real, rerr := filepath.EvalSymlinks(abs)
-			if rerr != nil {
-				return "", rerr
-			}
-			abs = real
-			break
-		}
-		parent := filepath.Dir(abs)
-		if parent == abs {
-			return "", fmt.Errorf("tools: cannot resolve %q", p)
-		}
-		tail = append(tail, filepath.Base(abs))
-		abs = parent
-	}
-	for i := len(tail) - 1; i >= 0; i-- {
-		abs = filepath.Join(abs, tail[i])
+	abs, err = realPath(abs)
+	if err != nil {
+		return "", err
 	}
 	if abs != rootReal && !strings.HasPrefix(abs, rootReal+string(os.PathSeparator)) {
 		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
 	}
 	return abs, nil
+}
+
+// realPath resolves symlinks along p. EvalSymlinks fails on paths that
+// don't exist yet (a new file or a not-yet-created workspace), so walk
+// to the deepest existing ancestor, resolve it, and rejoin the tail.
+func realPath(p string) (string, error) {
+	var tail []string
+	for {
+		if _, err := os.Lstat(p); err == nil {
+			real, rerr := filepath.EvalSymlinks(p)
+			if rerr != nil {
+				return "", rerr
+			}
+			for i := len(tail) - 1; i >= 0; i-- {
+				real = filepath.Join(real, tail[i])
+			}
+			return real, nil
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return "", fmt.Errorf("tools: cannot resolve %q", p)
+		}
+		tail = append(tail, filepath.Base(p))
+		p = parent
+	}
 }
 
 // ReadFile reads a file inside the workspace.

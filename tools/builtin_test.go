@@ -52,6 +52,27 @@ func TestSymlinkEscapeRejected(t *testing.T) {
 	}
 }
 
+// A relative workspace root (the CLI default ".") and a workspace that
+// does not exist yet must both resolve correctly.
+func TestRelativeAndMissingWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	old, _ := os.Getwd()
+	defer os.Chdir(old)
+	os.Chdir(dir)
+	w := Workspace{Root: "."}
+	wf := WriteFile{W: w}
+	args, _ := json.Marshal(map[string]string{"path": "f.txt", "content": "hi"})
+	if _, err := wf.Call(context.Background(), args); err != nil {
+		t.Fatalf("relative workspace rejected: %v", err)
+	}
+	w2 := Workspace{Root: filepath.Join(dir, "newws")}
+	wf2 := WriteFile{W: w2}
+	args, _ = json.Marshal(map[string]string{"path": "a/f.txt", "content": "hi"})
+	if _, err := wf2.Call(context.Background(), args); err != nil {
+		t.Fatalf("missing workspace rejected: %v", err)
+	}
+}
+
 func TestWriteThenRead(t *testing.T) {
 	dir := t.TempDir()
 	w := Workspace{Root: dir}
