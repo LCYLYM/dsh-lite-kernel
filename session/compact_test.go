@@ -50,6 +50,17 @@ func TestCompactFoldsHistory(t *testing.T) {
 	if folded != 0 {
 		t.Fatal("folded history leaked into context")
 	}
+	// The retained tail between ThroughSeq and the marker is ordinary
+	// history — it must still reach the model.
+	var kept int
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok && s == "msg-45" {
+			kept++
+		}
+	}
+	if kept != 1 {
+		t.Fatal("retained tail after ThroughSeq was dropped")
+	}
 }
 
 // Compaction cursor survives reopen.

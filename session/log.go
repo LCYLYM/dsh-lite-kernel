@@ -27,13 +27,13 @@ type Event struct {
 // int64 offset per event (~8 B/event: 100k events ≈ 0.8 MiB) — bounded by
 // design, unlike whole-history materialization.
 type Log struct {
-	mu        sync.Mutex
-	f         *os.File
-	path      string
-	offsets   []int64 // byte offset of each event line, index = seq-1... seq starts at 1
-	nextSeq   int64
-	subs      map[chan Event]struct{}
-	compactTo int64 // newest session/compaction ThroughSeq
+	mu      sync.Mutex
+	f       *os.File
+	path    string
+	offsets []int64 // byte offset of each event line, index = seq-1... seq starts at 1
+	nextSeq int64
+	subs    map[chan Event]struct{}
+	compact *Compaction // newest session/compaction marker, if any
 }
 
 // OpenLog opens (or creates) the log at path and rebuilds its offset index.
@@ -53,7 +53,7 @@ func OpenLog(path string) (*Log, error) {
 			if json.Unmarshal(sc.Bytes(), &ev) == nil && ev.Type == "session/compaction" {
 				var c Compaction
 				if json.Unmarshal(ev.Data, &c) == nil {
-					l.compactTo = c.ThroughSeq
+					l.compact = &c
 				}
 			}
 		}
@@ -74,9 +74,17 @@ func OpenLog(path string) (*Log, error) {
 // Len returns the number of events.
 func (l *Log) Len() int64 { return l.nextSeq - 1 }
 
-// CompactedThrough is the seq the newest compaction marker covers, kept
-// in memory — O(1), no scan.
-func (l *Log) CompactedThrough() int64 { return l.compactTo }
+// CompactedThrough is the seq the newest compaction marker covers (0
+// when none exists), kept in memory — O(1), no scan.
+func (l *Log) CompactedThrough() int64 {
+	if l.compact == nil {
+		return 0
+	}
+	return l.compact.ThroughSeq
+}
+
+// NewestCompaction returns the newest compaction marker, or nil.
+func (l *Log) NewestCompaction() *Compaction { return l.compact }
 
 // Append writes an event, fsyncs, and notifies subscribers. Delivery
 // order is seq order; subscribers that lag drop nothing — they replay
@@ -105,7 +113,7 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 	if typ == "session/compaction" {
 		var c Compaction
 		if json.Unmarshal(raw, &c) == nil {
-			l.compactTo = c.ThroughSeq
+			l.compact = &c
 		}
 	}
 	for ch := range l.subs {

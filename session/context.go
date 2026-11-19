@@ -49,21 +49,22 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		return nil, err
 	}
 	var rev []llm.Message
-	var comp *Compaction
+	// The newest compaction marker is the history floor: events with
+	// seq <= ThroughSeq are folded; the retained tail between ThroughSeq
+	// and the marker is ordinary history and must still be kept. The
+	// floor comes from the log's in-memory cursor, so the summary is
+	// available even when the budget exhausts before the scan reaches
+	// the marker.
+	floor := lg.CompactedThrough()
+	comp := lg.NewestCompaction()
 	for i := len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
 		ev := tail[i]
+		if ev.Seq <= floor {
+			break
+		}
 		var me messageEvent
 		var m llm.Message
 		switch ev.Type {
-		case "session/compaction":
-			// The newest marker is the history floor: everything at or
-			// before its ThroughSeq is folded, so stop scanning.
-			var c Compaction
-			if json.Unmarshal(ev.Data, &c) == nil {
-				comp = &c
-				i = 0 // break after this iteration
-			}
-			continue
 		case "user/message":
 			if err := json.Unmarshal(ev.Data, &me); err != nil {
 				continue
