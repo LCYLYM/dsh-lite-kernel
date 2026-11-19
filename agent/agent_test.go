@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -220,5 +221,61 @@ func TestDrainCrashBeforeAckReinjectsInvisible(t *testing.T) {
 	}
 	if seen != 1 {
 		t.Fatalf("notice rendered %d times after reinject", seen)
+	}
+}
+
+func TestDrainBatchCapLeavesRestPending(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	for i := 0; i < maxDrainBatch+3; i++ {
+		Post(lg, Notice{ID: fmt.Sprintf("n%d", i), From: "c", Kind: "k", Payload: json.RawMessage(`1`)})
+	}
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	mb := mailboxFor(lg)
+	if len(mb.pending) != 3 {
+		t.Fatalf("expected 3 pending after capped drain, got %d", len(mb.pending))
+	}
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	if len(mb.pending) != 0 {
+		t.Fatal("remaining notices not drained")
+	}
+}
+
+func TestMailboxIndexReleasedOnClose(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mailboxes.Load(lg); !ok {
+		t.Fatal("index missing after drain")
+	}
+	lg.Close()
+	if _, ok := mailboxes.Load(lg); ok {
+		t.Fatal("index rooted a closed log")
+	}
+}
+
+func TestIDlessNoticesAllRendered(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	// Two injections carrying ID-less notices — both must render.
+	lg.Append("mailbox/inject", map[string]any{"notices": []map[string]any{
+		{"from": "a", "kind": "k", "payload": json.RawMessage(`1`)},
+		{"from": "b", "kind": "k", "payload": json.RawMessage(`2`)},
+	}})
+	msgs, _ := session.BuildContext(lg, session.DefaultBudget())
+	found := 0
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok {
+			found += strings.Count(s, "[mailbox notice")
+		}
+	}
+	if found != 2 {
+		t.Fatalf("id-less notices collapsed: %d rendered", found)
 	}
 }

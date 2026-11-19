@@ -32,6 +32,7 @@ type Log struct {
 	offsets []int64 // byte offset of each event line, index = seq-1... seq starts at 1
 	nextSeq int64
 	subs    map[chan Event]struct{}
+	onClose []func()
 }
 
 // OpenLog opens (or creates) the log at path and rebuilds its offset index.
@@ -165,9 +166,24 @@ func (l *Log) Subscribe(buf int) (<-chan Event, func()) {
 	}
 }
 
-// Close flushes and closes the log file.
+// Close flushes, closes the log file, and runs registered cleanups —
+// indexes keyed on this log (mailbox, projections) release here rather
+// than pinning a closed log forever.
 func (l *Log) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.f.Close()
+	cbs := l.onClose
+	l.onClose = nil
+	err := l.f.Close()
+	l.mu.Unlock()
+	for _, fn := range cbs {
+		fn()
+	}
+	return err
+}
+
+// OnClose registers fn to run once when Close is called.
+func (l *Log) OnClose(fn func()) {
+	l.mu.Lock()
+	l.onClose = append(l.onClose, fn)
+	l.mu.Unlock()
 }

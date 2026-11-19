@@ -96,12 +96,22 @@ type mailboxState struct {
 	pending   map[string]Notice
 }
 
+// maxDrainBatch caps one drain's injection well below any plausible
+// context window — a giant batch would push its own inject event out
+// of the tail window while its acks stayed in, delivering nothing to
+// the model. Notices beyond the cap stay pending for the next step.
+const maxDrainBatch = 64
+
 var mailboxes sync.Map // *session.Log -> *mailboxState
 
 func mailboxFor(lg *session.Log) *mailboxState {
-	m, _ := mailboxes.LoadOrStore(lg, &mailboxState{
+	m, loaded := mailboxes.LoadOrStore(lg, &mailboxState{
 		delivered: map[string]bool{}, pending: map[string]Notice{},
 	})
+	if !loaded {
+		// The index must not root a closed log forever.
+		lg.OnClose(func() { mailboxes.Delete(lg) })
+	}
 	return m.(*mailboxState)
 }
 
@@ -144,6 +154,9 @@ func Drain(lg *session.Log) error {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	if len(ids) > maxDrainBatch {
+		ids = ids[:maxDrainBatch]
+	}
 	arr := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		n := mb.pending[id]

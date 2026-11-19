@@ -100,10 +100,13 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 			for _, n := range inj.Notices {
 				// A crash between inject and ack reinjects the notice on
 				// resume — render each id once so duplicates stay invisible.
-				if seenNotices[n.ID] {
-					continue
+				// ID-less notices are never deduped: "" would merge them all.
+				if n.ID != "" {
+					if seenNotices[n.ID] {
+						continue
+					}
+					seenNotices[n.ID] = true
 				}
-				seenNotices[n.ID] = true
 				fmt.Fprintf(&sb, "[mailbox notice from %s (%s)] %s\n", n.From, n.Kind, n.Payload)
 			}
 			if sb.Len() == 0 {
