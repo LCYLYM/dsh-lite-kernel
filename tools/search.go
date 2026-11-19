@@ -151,6 +151,10 @@ func (t GrepFile) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A cancelled scan is an incomplete result, not a partial success.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return map[string]any{"matches": hits, "truncated": truncated}, nil
 }
 
