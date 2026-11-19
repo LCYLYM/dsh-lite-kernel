@@ -75,6 +75,18 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
+		// Check spend before billing another call — an exhausted
+		// session aborts without contacting the provider (also covers
+		// reopened logs, where only durable usage survives).
+		if l.Guard.MaxSessionTokens > 0 {
+			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+				l.Log.Append("turn/end", map[string]any{
+					"reason": "aborted",
+					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
+				})
+				return Aborted, errors.New("agent: session token budget exceeded")
+			}
+		}
 		msgs, err := session.BuildContext(l.Log, l.Budget)
 		if err != nil {
 			return Failed, err
@@ -115,20 +127,6 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			ev["completion_tokens"] = resp.Usage.OutputTokens
 		}
 		l.Log.Append("assistant/message", ev)
-
-		// Session spend cap — runaway turns die on budget, not on the
-		// provider invoice (upstream: undetected token burn was a
-		// recurring complaint). A waiting retry resumes against the
-		// same durable total.
-		if l.Guard.MaxSessionTokens > 0 {
-			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
-				l.Log.Append("turn/end", map[string]any{
-					"reason": "aborted",
-					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
-				})
-				return Aborted, errors.New("agent: session token budget exceeded")
-			}
-		}
 
 		// Guard: repetition / no-progress / caps.
 		if abort, why := l.Guard.CheckStep(text, len(resp.Message.ToolCalls)); abort {

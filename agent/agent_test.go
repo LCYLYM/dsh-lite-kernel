@@ -142,9 +142,10 @@ func TestMailboxDurableReplay(t *testing.T) {
 }
 
 // meterProvider reports token usage like a real API.
-type meterProvider struct{}
+type meterProvider struct{ calls int }
 
-func (meterProvider) Complete(_ context.Context, _ *llm.Request) (*llm.Response, error) {
+func (m *meterProvider) Complete(_ context.Context, _ *llm.Request) (*llm.Response, error) {
+	m.calls++
 	return &llm.Response{
 		Message:      llm.Message{Role: "assistant", Content: "ok"},
 		FinishReason: "stop",
@@ -155,14 +156,23 @@ func (meterProvider) Complete(_ context.Context, _ *llm.Request) (*llm.Response,
 // A session whose spend exceeds MaxSessionTokens aborts with a logged
 // budget reason — the durable total, not an in-memory counter.
 func TestSessionTokenBudgetAborts(t *testing.T) {
-	loop, lg := newLoop(t, meterProvider{})
+	prov := &meterProvider{}
+	loop, lg := newLoop(t, prov)
 	loop.Guard.MaxSessionTokens = 120 // first call spends 150
+	// The turn that crossed the cap still completes its paid work…
 	state, err := loop.Run(context.Background(), "hi")
-	if state != Aborted || err == nil {
+	if state != Completed || err != nil {
 		t.Fatalf("state=%s err=%v", state, err)
 	}
 	u := session.Usage(lg)
 	if u.InputTokens != 100 || u.OutputTokens != 50 || u.Steps != 1 {
 		t.Fatalf("usage=%v", u)
+	}
+	// …but the next turn aborts WITHOUT billing the provider.
+	if state, _ := loop.Run(context.Background(), "again"); state != Aborted {
+		t.Fatalf("second run state=%s", state)
+	}
+	if prov.calls != 1 {
+		t.Fatalf("provider called %d times after budget exhausted", prov.calls)
 	}
 }
