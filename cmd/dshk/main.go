@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/LCYLYM/dsh-lite-kernel/agent"
@@ -38,11 +39,19 @@ func main() {
 
 func provider() (llm.Provider, string) {
 	key := os.Getenv("DEEPSEEK_API_KEY")
-	if key == "" {
-		key = os.Getenv("OPENAI_API_KEY")
-	}
 	base := os.Getenv("DSHK_BASE_URL")
 	model := os.Getenv("DSHK_MODEL")
+	// Match the endpoint to the key being sent: an OpenAI key must never
+	// be attached to a request aimed at another provider.
+	if key == "" {
+		key = os.Getenv("OPENAI_API_KEY")
+		if key != "" && base == "" {
+			base = "https://api.openai.com/v1"
+		}
+		if key != "" && model == "" {
+			model = "gpt-4o-mini"
+		}
+	}
 	if base == "" {
 		base = "https://api.deepseek.com/v1"
 	}
@@ -80,15 +89,19 @@ func cmdServe(args []string) {
 	addr := fs.String("addr", "127.0.0.1:3080", "listen address")
 	dir := fs.String("data", ".dshk/sessions", "session data dir")
 	ws := fs.String("workspace", ".", "workspace root for file tools")
+	token := fs.String("token", "", "require `Authorization: Bearer <token>` on every request (required beyond loopback)")
 	_ = fs.Parse(args)
 
 	store, err := session.NewStore(*dir)
 	if err != nil {
 		log.Fatal(err)
 	}
+	if *token == "" && !strings.HasPrefix(*addr, "127.") && !strings.HasPrefix(*addr, "localhost") && !strings.HasPrefix(*addr, "[::1]") {
+		log.Fatal("refusing to serve without -token on a non-loopback address")
+	}
 	prov, model := provider()
 	srv := &server.Server{Store: store, Provider: prov, Model: model,
-		NewLoop: newLoopFactory(store, prov, model, *ws)}
+		NewLoop: newLoopFactory(store, prov, model, *ws), Token: *token}
 
 	log.Printf("dsh-lite serving on http://%s (workspace %s)", *addr, *ws)
 	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))

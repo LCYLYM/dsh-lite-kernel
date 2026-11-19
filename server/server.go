@@ -30,10 +30,16 @@ type Server struct {
 	Provider llm.Provider
 	Model    string
 	NewLoop  func(ses *session.Session) *agent.Loop
+	// Token, when set, is required as `Authorization: Bearer <token>` on
+	// every request — the daemon serves full session transcripts, so
+	// callers must authenticate whenever it listens beyond loopback.
+	Token string
 
 	mu    sync.Mutex
 	loops map[string]*agent.Loop
 }
+
+const maxBodyBytes = 1 << 20 // uploads are bounded at 1 MiB
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -43,6 +49,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", s.postMessage)
 	mux.HandleFunc("GET /v1/sessions/{id}/events", s.streamEvents)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
+	if s.Token != "" {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer "+s.Token {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+	}
 	return mux
 }
 
@@ -83,7 +98,7 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Text string `json:"text"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Text == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&body); err != nil || body.Text == "" {
 		http.Error(w, "text required", http.StatusBadRequest)
 		return
 	}
@@ -106,7 +121,7 @@ func (s *Server) postNotice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var n agent.Notice
-	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&n); err != nil {
 		http.Error(w, "bad notice", http.StatusBadRequest)
 		return
 	}
