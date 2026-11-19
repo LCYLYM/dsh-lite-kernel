@@ -76,4 +76,21 @@ func TestPlanValidation(t *testing.T) {
 	if _, err := pt.Call(context.Background(), raw); err == nil {
 		t.Fatal("bad action accepted")
 	}
+	raw, _ = json.Marshal(map[string]any{"action": "complete_step"})
+	if _, err := pt.Call(context.Background(), raw); err == nil {
+		t.Fatal("complete_step without step accepted")
+	}
+}
+
+// Completing a later step must not restart an earlier pending one.
+func TestPlanOutOfOrderComplete(t *testing.T) {
+	pt, lg, _ := planTool(t)
+	defer lg.Close()
+	planCall(t, pt, map[string]any{"action": "write", "steps": []PlanStep{
+		{Text: "A", Status: "pending"}, {Text: "B", Status: "in_progress"}, {Text: "C", Status: "pending"},
+	}})
+	steps := planCall(t, pt, map[string]any{"action": "complete_step", "step": 1})
+	if steps[0].Status != "pending" || steps[1].Status != "done" || steps[2].Status != "in_progress" {
+		t.Fatalf("%v", steps)
+	}
 }

@@ -5,9 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/LCYLYM/dsh-lite-kernel/session"
 )
+
+// planMu serializes plan read-modify-append transactions — the log's
+// own lock is released between ReadFrom and Append, so two concurrent
+// complete_step calls could otherwise both read the same state and the
+// later snapshot would discard the earlier completion.
+var planMu sync.Mutex
 
 // PlanStep is one item of the agent's working plan.
 type PlanStep struct {
@@ -26,7 +33,7 @@ func (t PlanTool) Description() string {
 	return "Track multi-step work: replace or update the current plan"
 }
 func (t PlanTool) Schema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"action":{"type":"string","enum":["read","write","complete_step"]},"steps":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text"]}},"step":{"type":"integer"}},"required":["action"]}`)
+	return json.RawMessage(`{"type":"object","properties":{"action":{"type":"string","enum":["read","write","complete_step"]},"steps":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["text"]}},"step":{"type":"integer","description":"index of the step to complete; required for complete_step"}},"required":["action"]}`)
 }
 
 // Call implements the plan actions:
@@ -39,11 +46,13 @@ func (t PlanTool) Call(_ context.Context, args json.RawMessage) (any, error) {
 	var a struct {
 		Action string     `json:"action"`
 		Steps  []PlanStep `json:"steps"`
-		Step   int        `json:"step"`
+		Step   *int       `json:"step"` // required for complete_step
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, err
 	}
+	planMu.Lock()
+	defer planMu.Unlock()
 	steps := readPlan(t.Log)
 	switch a.Action {
 	case "read":
@@ -64,16 +73,22 @@ func (t PlanTool) Call(_ context.Context, args json.RawMessage) (any, error) {
 		}
 		steps = a.Steps
 	case "complete_step":
-		if a.Step < 0 || a.Step >= len(steps) {
-			return nil, fmt.Errorf("agent: plan step %d out of range (%d steps)", a.Step, len(steps))
+		if a.Step == nil {
+			return nil, fmt.Errorf("agent: complete_step requires step")
 		}
-		steps[a.Step].Status = "done"
+		n := *a.Step
+		if n < 0 || n >= len(steps) {
+			return nil, fmt.Errorf("agent: plan step %d out of range (%d steps)", n, len(steps))
+		}
+		steps[n].Status = "done"
 		for i := range steps {
 			if steps[i].Status == "in_progress" {
 				steps[i].Status = "pending"
 			}
 		}
-		for i := range steps {
+		// Advance to the next pending step *after* n — completing a later
+		// step must not restart an earlier one.
+		for i := n + 1; i < len(steps); i++ {
 			if steps[i].Status == "pending" {
 				steps[i].Status = "in_progress"
 				break
