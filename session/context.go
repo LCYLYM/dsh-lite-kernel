@@ -62,7 +62,8 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		for k := range seenNotices {
 			delete(seenNotices, k)
 		}
-		for i := len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
+		var i int
+		for i = len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
 			ev := tail[i]
 			var me messageEvent
 			var m llm.Message
@@ -136,7 +137,11 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 			count++
 			rev = append(rev, m)
 		}
-		if len(tail) < window || count >= b.MaxEvents || used >= b.MaxBytes || window >= int(lg.Len()) {
+		// Widen only when the scan consumed a FULL window and is still
+		// hungry: control events crowded it out. Any early stop (budget
+		// or count cap hit mid-window, i >= 0) means older history could
+		// not fit anyway — widening would just load the entire log.
+		if i >= 0 || len(tail) < window || window >= int(lg.Len()) {
 			break
 		}
 	}

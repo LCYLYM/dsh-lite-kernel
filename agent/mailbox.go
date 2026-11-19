@@ -60,6 +60,14 @@ func Pending(lg *session.Log) ([]Notice, error) {
 				delivered[d.ID] = true
 				pending = filterOut(pending, d.ID)
 			}
+		case "mailbox/undeliver":
+			var u struct {
+				Notice Notice `json:"notice"`
+			}
+			if json.Unmarshal(ev.Data, &u) == nil {
+				delivered[u.Notice.ID] = false
+				pending = append(pending, u.Notice)
+			}
 		}
 		return true
 	})
@@ -106,6 +114,7 @@ type mailboxState struct {
 	scanned   int64
 	delivered map[string]bool
 	pending   map[string]Notice
+	injected  []Notice // injected this turn, awaiting its outcome
 }
 
 // maxDrainBatch caps one drain's injection well below any plausible
@@ -144,6 +153,14 @@ func (mb *mailboxState) scan(lg *session.Log) error {
 			if json.Unmarshal(ev.Data, &d) == nil {
 				delete(mb.pending, d.ID)
 				mb.delivered[d.ID] = true
+			}
+		case "mailbox/undeliver":
+			var u struct {
+				Notice Notice `json:"notice"`
+			}
+			if json.Unmarshal(ev.Data, &u) == nil {
+				delete(mb.delivered, u.Notice.ID)
+				mb.pending[u.Notice.ID] = u.Notice
 			}
 		}
 		return true
@@ -189,11 +206,35 @@ func Drain(lg *session.Log) error {
 		return err
 	}
 	for _, id := range ids {
+		n := mb.pending[id]
 		if err := Delivered(lg, id); err != nil {
 			return err
 		}
 		delete(mb.pending, id)
 		mb.delivered[id] = true
+		mb.injected = append(mb.injected, n)
 	}
 	return nil
+}
+
+// turnOutcome resolves the notices a drive injected. A turn that fails
+// after acking would otherwise swallow them — the inject sits in the
+// log while nothing ever delivers it again. On failure each one is
+// re-pended AND a mailbox/undeliver record lands in the log so the
+// index rebuilds identically after a restart. Call with the drive's
+// final error; nil just clears the batch.
+func turnOutcome(lg *session.Log, err error) {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if err == nil {
+		mb.injected = nil
+		return
+	}
+	for _, n := range mb.injected {
+		delete(mb.delivered, n.ID)
+		mb.pending[n.ID] = n
+		lg.Append("mailbox/undeliver", map[string]any{"notice": n})
+	}
+	mb.injected = nil
 }

@@ -131,7 +131,8 @@ func (l *Loop) Resume(ctx context.Context) (TurnState, error) {
 // assistant output is committed with truncated=true, so the next request
 // carries the partial output plus a continue hint — never a stateless
 // re-run (#13647).
-func (l *Loop) drive(ctx context.Context) (TurnState, error) {
+func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
+	defer func() { turnOutcome(l.Log, err) }()
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
