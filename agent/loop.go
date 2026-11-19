@@ -17,10 +17,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -105,8 +105,13 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
+		if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+			l.Log.Append("turn/usage", map[string]any{
+				"prompt_tokens": resp.Usage.InputTokens, "completion_tokens": resp.Usage.OutputTokens,
+			})
+		}
 
 		// Guard: repetition / no-progress / caps.
 		if abort, why := l.Guard.CheckStep(text, len(resp.Message.ToolCalls)); abort {
