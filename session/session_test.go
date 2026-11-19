@@ -1,6 +1,7 @@
 package session
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -107,5 +108,42 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	msgs, _ := BuildContext(lg, ContextBudget{MaxBytes: 1 << 20, MaxEvents: 100})
 	if len(msgs) != 2 {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
+	}
+}
+
+func TestOpenLogValidatesSeqs(t *testing.T) {
+	dir := t.TempDir()
+	good := `{"seq":1,"type":"a","data":{},"ts":"x"}` + "\n" +
+		`{"seq":2,"type":"b","data":{},"ts":"x"}` + "\n"
+	// partial tail: truncated to committed content, open succeeds
+	p := filepath.Join(dir, "t.jsonl")
+	os.WriteFile(p, []byte(good+`{"seq":3,"ty`), 0o600)
+	lg, err := OpenLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lg.Len() != 2 {
+		t.Fatalf("Len=%d", lg.Len())
+	}
+	fi, _ := os.Stat(p)
+	if fi.Size() != int64(len(good)) {
+		t.Fatal("partial tail not truncated")
+	}
+	// appends continue from seq 3
+	if ev, _ := lg.Append("c", nil); ev.Seq != 3 {
+		t.Fatalf("next seq %d", ev.Seq)
+	}
+	lg.Close()
+	// corrupt middle line → fail loud
+	p2 := filepath.Join(dir, "m.jsonl")
+	os.WriteFile(p2, []byte(good+"garbage\n"+`{"seq":3,"type":"c","data":{},"ts":"x"}`+"\n"), 0o600)
+	if _, err := OpenLog(p2); err == nil {
+		t.Fatal("mid-log corruption accepted")
+	}
+	// seq gap → fail loud
+	p3 := filepath.Join(dir, "g.jsonl")
+	os.WriteFile(p3, []byte(good+`{"seq":9,"type":"c","data":{},"ts":"x"}`+"\n"), 0o600)
+	if _, err := OpenLog(p3); err == nil {
+		t.Fatal("seq gap accepted")
 	}
 }

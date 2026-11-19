@@ -41,13 +41,35 @@ func OpenLog(path string) (*Log, error) {
 		return nil, err
 	}
 	l := &Log{f: f, path: path, nextSeq: 1, subs: map[chan Event]struct{}{}}
+	fi, _ := f.Stat()
+	var size int64
+	if fi != nil {
+		size = fi.Size()
+	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	var off int64
 	for sc.Scan() {
-		l.offsets = append(l.offsets, off)
-		off += int64(len(sc.Bytes())) + 1
-		l.nextSeq++
+		line := sc.Bytes()
+		var ev Event
+		jerr := json.Unmarshal(line, &ev)
+		switch {
+		case jerr == nil && ev.Seq == l.nextSeq:
+			l.offsets = append(l.offsets, off)
+			l.nextSeq++
+		case jerr != nil && off+int64(len(line))+1 >= size:
+			// Unparseable LAST line: a crash mid-append never committed —
+			// drop the uncommitted tail so later appends don't leave the
+			// garbage embedded in the middle of the log.
+			if err := f.Truncate(off); err != nil {
+				f.Close()
+				return nil, err
+			}
+		default:
+			f.Close()
+			return nil, fmt.Errorf("session: corrupt log %s at seq %d", path, l.nextSeq)
+		}
+		off += int64(len(line)) + 1
 	}
 	if err := sc.Err(); err != nil {
 		f.Close()
