@@ -2,6 +2,8 @@ package agent
 
 import (
 	"encoding/json"
+	"sort"
+	"sync"
 
 	"github.com/LCYLYM/dsh-lite-kernel/session"
 )
@@ -80,4 +82,84 @@ func filterOut(ns []Notice, id string) []Notice {
 		}
 	}
 	return out
+}
+
+// mailboxState indexes notices per log: rebuilt once on first drain,
+// then advanced only over newly appended events, so a step's drain
+// costs O(new events) instead of O(history). One mutex serializes the
+// whole select→inject→ack batch — two turns on the same log cannot
+// inject the same notice twice.
+type mailboxState struct {
+	mu        sync.Mutex
+	scanned   int64
+	delivered map[string]bool
+	pending   map[string]Notice
+}
+
+var mailboxes sync.Map // *session.Log -> *mailboxState
+
+func mailboxFor(lg *session.Log) *mailboxState {
+	m, _ := mailboxes.LoadOrStore(lg, &mailboxState{
+		delivered: map[string]bool{}, pending: map[string]Notice{},
+	})
+	return m.(*mailboxState)
+}
+
+// Drain scans new log events for notices, injects every pending one
+// into the model-visible stream, then acknowledges. The inject event
+// lands BEFORE the acknowledgements: a crash between them replays the
+// notice as a duplicate (deduped for the model by BuildContext), never
+// a silent loss.
+func Drain(lg *session.Log) error {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	last := mb.scanned
+	err := lg.ReadFrom(mb.scanned, func(ev session.Event) bool {
+		last = ev.Seq
+		switch ev.Type {
+		case "mailbox/notice":
+			var n Notice
+			if json.Unmarshal(ev.Data, &n) == nil && !mb.delivered[n.ID] {
+				mb.pending[n.ID] = n
+			}
+		case "mailbox/delivered":
+			var d deliveredData
+			if json.Unmarshal(ev.Data, &d) == nil {
+				delete(mb.pending, d.ID)
+				mb.delivered[d.ID] = true
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	mb.scanned = last
+	if len(mb.pending) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(mb.pending))
+	for id := range mb.pending {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	arr := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		n := mb.pending[id]
+		arr = append(arr, map[string]any{
+			"id": n.ID, "from": n.From, "kind": n.Kind, "payload": n.Payload,
+		})
+	}
+	if _, err := lg.Append("mailbox/inject", map[string]any{"notices": arr}); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := Delivered(lg, id); err != nil {
+			return err
+		}
+		delete(mb.pending, id)
+		mb.delivered[id] = true
+	}
+	return nil
 }

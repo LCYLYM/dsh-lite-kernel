@@ -49,6 +49,7 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		return nil, err
 	}
 	var rev []llm.Message
+	seenNotices := map[string]bool{}
 	for i := len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
 		ev := tail[i]
 		var me messageEvent
@@ -86,6 +87,7 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		case "mailbox/inject":
 			var inj struct {
 				Notices []struct {
+					ID      string          `json:"id"`
 					From    string          `json:"from"`
 					Kind    string          `json:"kind"`
 					Payload json.RawMessage `json:"payload"`
@@ -96,7 +98,16 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 			}
 			var sb strings.Builder
 			for _, n := range inj.Notices {
+				// A crash between inject and ack reinjects the notice on
+				// resume — render each id once so duplicates stay invisible.
+				if seenNotices[n.ID] {
+					continue
+				}
+				seenNotices[n.ID] = true
 				fmt.Fprintf(&sb, "[mailbox notice from %s (%s)] %s\n", n.From, n.Kind, n.Payload)
+			}
+			if sb.Len() == 0 {
+				continue
 			}
 			m = llm.Message{Role: "user", Content: strings.TrimRight(sb.String(), "\n")}
 		default:

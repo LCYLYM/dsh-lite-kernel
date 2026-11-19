@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -183,5 +185,40 @@ func TestMailboxNoticesReachNextRequest(t *testing.T) {
 	}
 	if seen != 1 {
 		t.Fatalf("expected exactly one injected notice, got %d", seen)
+	}
+}
+
+func TestDrainCrashBeforeAckReinjectsInvisible(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lg, _ := session.OpenLog(path)
+	Post(lg, Notice{ID: "n1", From: "c", Kind: "done", Payload: json.RawMessage(`1`)})
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after inject but before ack: strip the delivered
+	// events by rewriting the log without them, then reopen.
+	f, _ := os.ReadFile(path)
+	kept := []byte{}
+	for _, line := range bytes.Split(f, []byte("\n")) {
+		if len(line) > 0 && !bytes.Contains(line, []byte("delivered")) {
+			kept = append(append(kept, line...), '\n')
+		}
+	}
+	os.WriteFile(path, kept, 0o600)
+	lg2, _ := session.OpenLog(path)
+	if err := Drain(lg2); err != nil {
+		t.Fatal(err)
+	}
+	// notice is injected again, but BuildContext dedups by id
+	msgs, _ := session.BuildContext(lg2, session.DefaultBudget())
+	seen := 0
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice from c") {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("notice rendered %d times after reinject", seen)
 	}
 }
