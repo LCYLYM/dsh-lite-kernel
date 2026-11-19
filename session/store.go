@@ -5,8 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
+	"time"
 )
+
+// validID constrains caller-supplied session ids so they can never
+// escape the data dir through "../" or separators.
+var validID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 
 // Session is a durable conversation: a log plus metadata.
 type Session struct {
@@ -43,7 +49,9 @@ func (s *Store) Create(workspace string) (*Session, error) {
 
 func (s *Store) create(workspace string) (*Session, error) {
 	s.seq++
-	id := fmt.Sprintf("session-%d-%d", s.seq, len(s.live)+1)
+	// Time-based component: two `dshk run`s on the same data dir must not
+	// mint the same id and silently share a log.
+	id := fmt.Sprintf("session-%d-%d", time.Now().UnixNano(), s.seq)
 	path := filepath.Join(s.dir, id+".jsonl")
 	lg, err := OpenLog(path)
 	if err != nil {
@@ -87,6 +95,9 @@ func (s *Store) Get(id string) (*Session, error) {
 	defer s.mu.Unlock()
 	if ses, ok := s.live[id]; ok {
 		return ses, nil
+	}
+	if !validID.MatchString(id) {
+		return nil, fmt.Errorf("session: invalid session id %q", id)
 	}
 	path := filepath.Join(s.dir, id+".jsonl")
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
