@@ -102,16 +102,19 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 
 		text := contentText(resp.Message.Content)
 		truncated := resp.FinishReason == "length" || resp.FinishReason == "max_tokens"
-		l.Log.Append("assistant/message", map[string]any{
+		// Usage rides on the message event itself: one atomic append —
+		// a crash between the two can never lose usage a reply saved,
+		// and accounting costs zero extra events in the log.
+		ev := map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
 			"finish":     resp.FinishReason, "truncated": truncated,
-		})
-		if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
-			l.Log.Append("turn/usage", map[string]any{
-				"prompt_tokens": resp.Usage.InputTokens, "completion_tokens": resp.Usage.OutputTokens,
-			})
 		}
+		if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+			ev["prompt_tokens"] = resp.Usage.InputTokens
+			ev["completion_tokens"] = resp.Usage.OutputTokens
+		}
+		l.Log.Append("assistant/message", ev)
 
 		// Guard: repetition / no-progress / caps.
 		if abort, why := l.Guard.CheckStep(text, len(resp.Message.ToolCalls)); abort {
