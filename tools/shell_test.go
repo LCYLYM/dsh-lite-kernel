@@ -71,6 +71,15 @@ func TestShellConfined(t *testing.T) {
 	if strings.TrimSpace(res["output"].(string)) != "" {
 		t.Fatalf("host dirs not covered: %v", res)
 	}
+	// /dev is masked too — only the re-bound safe nodes and shm exist.
+	res = call("ls /dev")
+	for _, line := range strings.Fields(res["output"].(string)) {
+		switch line {
+		case "null", "zero", "urandom", "shm":
+		default:
+			t.Fatalf("host device %q exposed: %v", line, res)
+		}
+	}
 	// Quote-split words like r""m are just words in a namespace — rm
 	// inside the workspace is legitimate and works.
 	os.WriteFile(filepath.Join(dir, "junk.txt"), []byte("x"), 0o644)
