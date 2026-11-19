@@ -2,6 +2,8 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
 )
@@ -47,11 +49,21 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		return nil, err
 	}
 	var rev []llm.Message
+	var comp *Compaction
 	for i := len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
 		ev := tail[i]
 		var me messageEvent
 		var m llm.Message
 		switch ev.Type {
+		case "session/compaction":
+			// The newest marker is the history floor: everything at or
+			// before its ThroughSeq is folded, so stop scanning.
+			var c Compaction
+			if json.Unmarshal(ev.Data, &c) == nil {
+				comp = &c
+				i = 0 // break after this iteration
+			}
+			continue
 		case "user/message":
 			if err := json.Unmarshal(ev.Data, &me); err != nil {
 				continue
@@ -95,8 +107,13 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 	for i := len(rev) - 1; i >= 0; i-- {
 		msgs = append(msgs, rev[i])
 	}
-	if b.SystemText != "" {
-		msgs = append([]llm.Message{{Role: "system", Content: b.SystemText}}, msgs...)
+	sys := b.SystemText
+	if comp != nil {
+		sys += fmt.Sprintf("\n[earlier history compacted: %d events folded at seq %d; first request was %q; tools used so far: %s]",
+			comp.Dropped, comp.ThroughSeq, comp.FirstUser, strings.Join(comp.ToolNames, ", "))
+	}
+	if sys != "" {
+		msgs = append([]llm.Message{{Role: "system", Content: sys}}, msgs...)
 	}
 	return msgs, nil
 }

@@ -17,10 +17,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -79,6 +79,15 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		if err != nil {
 			return Failed, err
 		}
+		// Pressure compaction: when the retained history window alone
+		// cannot fit the budget, fold history before it happens again
+		// (deterministic — no model call, no route to misconfigure).
+		if l.shouldCompact(msgs) {
+			l.compact()
+			if msgs, err = session.BuildContext(l.Log, l.Budget); err != nil {
+				return Failed, err
+			}
+		}
 		var resp *llm.Response
 		err = l.Retry.Do(ctx, func(c context.Context) error {
 			var e error
@@ -105,7 +114,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
 
 		// Guard: repetition / no-progress / caps.
@@ -148,6 +157,21 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	}
 	l.Log.Append("turn/end", map[string]any{"reason": "aborted", "detail": "MaxSteps exceeded"})
 	return Aborted, errors.New("agent: step budget exhausted")
+}
+
+// shouldCompact fires when unfolded history exceeds the context scan
+// window — the sign that the next request would silently drop old
+// events rather than fold them.
+func (l *Loop) shouldCompact(msgs []llm.Message) bool {
+	window := int64(l.Budget.MaxEvents * 4)
+	return l.Log.Len()-l.Log.CompactedThrough() > window
+}
+
+func (l *Loop) compact() {
+	through := l.Log.Len() - int64(l.Budget.MaxEvents)
+	if err := session.Compact(l.Log, through); err != nil {
+		l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()})
+	}
 }
 
 func contentText(c any) string {
