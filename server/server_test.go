@@ -182,3 +182,35 @@ func TestPostMessageBusyConflict(t *testing.T) {
 		t.Fatalf("post after turn end: %d", code)
 	}
 }
+
+// A notice posted to an idle session wakes it: Resume drives a turn
+// that drains the mailbox into the next provider request — the child
+// completion is acted on now, not when the user next speaks.
+func TestNoticeWakesIdleSession(t *testing.T) {
+	ts, st := newTestServer(t)
+	defer ts.Close()
+	post(t, ts.URL+"/v1/sessions", `{"workspace":"ws"}`)
+	id := st.List()[0]
+
+	post(t, ts.URL+"/v1/sessions/"+id+"/notices",
+		`{"id":"n-wake","from":"child-1","kind":"done","payload":{"ok":true}}`)
+
+	var inject bool
+	for i := 0; i < 50; i++ {
+		ses, _ := st.Get(id)
+		inject = false
+		ses.Log.ReadFrom(0, func(ev session.Event) bool {
+			if ev.Type == "mailbox/inject" {
+				inject = true
+			}
+			return !inject
+		})
+		if inject {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !inject {
+		t.Fatal("notice never consumed by a wake-driven turn")
+	}
+}

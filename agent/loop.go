@@ -91,6 +91,19 @@ func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
 	return state, err
 }
 
+// Resume wakes an idle session without a user message — a mailbox
+// notice delivered to a session with no turn in flight triggers it.
+// The injected notice is the model-visible input, so the turn still
+// reconstructs from the log. Returns ErrTurnBusy when a turn is
+// already running (that turn's own drain picks the notice up).
+func (l *Loop) Resume(ctx context.Context) (TurnState, error) {
+	if !l.turnMu.TryLock() {
+		return Failed, ErrTurnBusy
+	}
+	defer l.turnMu.Unlock()
+	return l.drive(ctx)
+}
+
 // Continue resumes after a finish=length truncation. The truncated
 // assistant output is committed with truncated=true, so the next request
 // carries the partial output plus a continue hint — never a stateless
@@ -99,6 +112,9 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
+		if err := Drain(l.Log); err != nil {
+			return Failed, err
+		}
 		msgs, err := session.BuildContext(l.Log, l.Budget)
 		if err != nil {
 			return Failed, err

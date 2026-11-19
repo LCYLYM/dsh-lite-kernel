@@ -2,6 +2,8 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
 )
@@ -47,6 +49,7 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		return nil, err
 	}
 	var rev []llm.Message
+	seenNotices := map[string]bool{}
 	for i := len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
 		ev := tail[i]
 		var me messageEvent
@@ -81,6 +84,35 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 				continue
 			}
 			m = llm.Message{Role: "tool", Content: me.Content, ToolCallID: me.ToolCallID}
+		case "mailbox/inject":
+			var inj struct {
+				Notices []struct {
+					ID      string          `json:"id"`
+					From    string          `json:"from"`
+					Kind    string          `json:"kind"`
+					Payload json.RawMessage `json:"payload"`
+				} `json:"notices"`
+			}
+			if err := json.Unmarshal(ev.Data, &inj); err != nil || len(inj.Notices) == 0 {
+				continue
+			}
+			var sb strings.Builder
+			for _, n := range inj.Notices {
+				// A crash between inject and ack reinjects the notice on
+				// resume — render each id once so duplicates stay invisible.
+				// ID-less notices are never deduped: "" would merge them all.
+				if n.ID != "" {
+					if seenNotices[n.ID] {
+						continue
+					}
+					seenNotices[n.ID] = true
+				}
+				fmt.Fprintf(&sb, "[mailbox notice from %s (%s)] %s\n", n.From, n.Kind, n.Payload)
+			}
+			if sb.Len() == 0 {
+				continue
+			}
+			m = llm.Message{Role: "user", Content: strings.TrimRight(sb.String(), "\n")}
 		default:
 			continue
 		}
