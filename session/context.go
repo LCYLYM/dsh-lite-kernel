@@ -41,6 +41,14 @@ type messageEvent struct {
 // stateless-"continue" re-run loop, discussion #13647).
 func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 	var msgs []llm.Message
+	if b.MaxEvents <= 0 {
+		// No history fits — the zero window could never widen out of
+		// itself, so don't enter the widening loop at all.
+		if b.SystemText != "" {
+			return []llm.Message{{Role: "system", Content: b.SystemText}}, nil
+		}
+		return msgs, nil
+	}
 	var rev []llm.Message
 	used := 0
 	count := 0

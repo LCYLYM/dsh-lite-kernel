@@ -2,6 +2,9 @@ package session
 
 import (
 	"path/filepath"
+	"time"
+
+	"github.com/LCYLYM/dsh-lite-kernel/llm"
 	"strings"
 	"sync"
 	"testing"
@@ -107,5 +110,27 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	msgs, _ := BuildContext(lg, ContextBudget{MaxBytes: 1 << 20, MaxEvents: 100})
 	if len(msgs) != 2 {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
+	}
+}
+
+// MaxEvents=0 must not hang: the zero window can't widen out of itself.
+func TestBuildContextZeroEvents(t *testing.T) {
+	lg, err := OpenLog(filepath.Join(t.TempDir(), "z.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Append("user/message", map[string]any{"role": "user", "content": "hi"})
+	done := make(chan []llm.Message, 1)
+	go func() {
+		m, _ := BuildContext(lg, ContextBudget{MaxEvents: 0, MaxBytes: 1 << 10, SystemText: "sys"})
+		done <- m
+	}()
+	select {
+	case m := <-done:
+		if len(m) != 1 || m[0].Role != "system" {
+			t.Fatalf("msgs %v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BuildContext hung")
 	}
 }
