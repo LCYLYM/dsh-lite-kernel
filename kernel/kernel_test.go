@@ -77,5 +77,5 @@ type PluginFunc struct {
 	fn   func(*Scope) error
 }
 
-func (p PluginFunc) Name() string             { return p.name }
-func (p PluginFunc) Setup(s *Scope) error     { return p.fn(s) }
+func (p PluginFunc) Name() string         { return p.name }
+func (p PluginFunc) Setup(s *Scope) error { return p.fn(s) }
