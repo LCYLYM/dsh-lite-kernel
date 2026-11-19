@@ -12,8 +12,9 @@ import (
 // never lose its completion notice silently (discussion #13656).
 //
 // Event types:
-//   mailbox/notice   {id, from, kind, payload}
-//   mailbox/delivered{id}
+//
+//	mailbox/notice   {id, from, kind, payload}
+//	mailbox/delivered{id}
 type Notice struct {
 	ID      string          `json:"id"`
 	From    string          `json:"from"`
