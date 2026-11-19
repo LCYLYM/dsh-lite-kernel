@@ -53,6 +53,12 @@ done
 mount -t tmpfs -o size=4m tmpfs /dev
 for d in null zero full random urandom tty ptmx; do touch "/dev/$d"; done
 mkdir /dev/shm /dev/pts
+# Descriptor links — plain symlinks onto /proc/self/fd so process
+# substitution and std-stream paths keep working.
+ln -s /proc/self/fd /dev/fd
+ln -s /proc/self/fd/0 /dev/stdin
+ln -s /proc/self/fd/1 /dev/stdout
+ln -s /proc/self/fd/2 /dev/stderr
 mount -t tmpfs -o size=4m tmpfs /dev/shm
 mount -t tmpfs -o size=64m tmpfs /tmp
 exec sh -c 'cd /mnt && exec sh -c "$1"' _ "$CMD"

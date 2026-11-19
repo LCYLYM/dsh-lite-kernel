@@ -76,7 +76,8 @@ func TestShellConfined(t *testing.T) {
 	res = call("ls /dev")
 	for _, line := range strings.Fields(res["output"].(string)) {
 		switch line {
-		case "null", "zero", "full", "random", "urandom", "tty", "ptmx", "pts", "shm":
+		case "null", "zero", "full", "random", "urandom", "tty", "ptmx", "pts", "shm",
+			"fd", "stdin", "stdout", "stderr":
 		default:
 			t.Fatalf("host device %q exposed: %v", line, res)
 		}
