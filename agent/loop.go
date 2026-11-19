@@ -43,6 +43,16 @@ type Loop struct {
 // flight on the same log.
 var ErrTurnBusy = errors.New("agent: turn already in progress")
 
+// Busy reports whether a turn is in flight. It is a probe for callers
+// that want to reject early; Run still enforces the exclusion itself.
+func (l *Loop) Busy() bool {
+	if !l.turnMu.TryLock() {
+		return true
+	}
+	l.turnMu.Unlock()
+	return false
+}
+
 // Run executes one user turn: append the message, step the loop under the
 // guard, persist every model-visible event. Two concurrent Runs on the
 // same log would interleave events (user B's message landing mid-turn A)
