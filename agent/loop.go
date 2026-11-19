@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
@@ -17,10 +18,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -34,11 +35,24 @@ type Loop struct {
 	Retry      llm.Policy
 	AutoResume bool // re-drive the turn after Waiting (goal runs, #13621)
 	ResumeMax  int
+
+	turnMu sync.Mutex // one in-flight turn per log — see Run
 }
 
+// ErrTurnBusy is returned when a second Run starts while a turn is in
+// flight on the same log.
+var ErrTurnBusy = errors.New("agent: turn already in progress")
+
 // Run executes one user turn: append the message, step the loop under the
-// guard, persist every model-visible event.
+// guard, persist every model-visible event. Two concurrent Runs on the
+// same log would interleave events (user B's message landing mid-turn A)
+// — the second caller gets ErrTurnBusy, a caller-visible rejection rather
+// than a silently corrupted history.
 func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
+	if !l.turnMu.TryLock() {
+		return Failed, ErrTurnBusy
+	}
+	defer l.turnMu.Unlock()
 	if _, err := l.Log.Append("user/message", map[string]any{
 		"role": "user", "content": userText,
 	}); err != nil {
@@ -105,7 +119,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
 
 		// Guard: repetition / no-progress / caps.

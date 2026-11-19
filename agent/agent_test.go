@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -139,4 +140,28 @@ func TestMailboxDurableReplay(t *testing.T) {
 	if len(pend) != 0 {
 		t.Fatal("notice not acked")
 	}
+}
+
+// slowProvider holds the first call until released.
+type slowProvider struct{ gate chan struct{} }
+
+func (p *slowProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	select {
+	case <-p.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestConcurrentRunRejected(t *testing.T) {
+	gate := make(chan struct{})
+	loop, _ := newLoop(t, &slowProvider{gate: gate})
+	go loop.Run(context.Background(), "first")
+	time.Sleep(50 * time.Millisecond)
+	state, err := loop.Run(context.Background(), "second")
+	if !errors.Is(err, ErrTurnBusy) || state != Failed {
+		t.Fatalf("second run: state=%s err=%v", state, err)
+	}
+	close(gate)
 }
