@@ -135,8 +135,13 @@ func (s *Server) postNotice(w http.ResponseWriter, r *http.Request) {
 		if state == agent.Failed && !errors.Is(err, agent.ErrTurnBusy) {
 			log.Printf("notice resume %s: %v", ses.ID, err)
 		}
-		// Wake-driven turns also release the loop cache.
-		s.dropLoop(ses.ID, l)
+		// Only a wake that acquired the turn may release the cached loop:
+		// on ErrTurnBusy this is the loop serving the active turn, and
+		// evicting it would let the next request build a second Loop with
+		// its own turnMu — two turns interleaving one history.
+		if !errors.Is(err, agent.ErrTurnBusy) {
+			s.dropLoop(ses.ID, l)
+		}
 	}()
 	writeJSON(w, map[string]any{"posted": n.ID})
 }
