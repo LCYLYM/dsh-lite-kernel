@@ -54,3 +54,12 @@ func TestFetchBodyCap(t *testing.T) {
 		t.Fatalf("%v", res)
 	}
 }
+
+func TestFetchRefusesSharedAddressSpace(t *testing.T) {
+	// RFC 6598 shared space — Alibaba metadata lives at 100.100.100.200.
+	args, _ := json.Marshal(map[string]string{"url": "http://100.100.100.200/latest/meta-data/"})
+	_, err := Fetch{}.Call(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "non-public") {
+		t.Fatalf("expected non-public refusal, got %v", err)
+	}
+}

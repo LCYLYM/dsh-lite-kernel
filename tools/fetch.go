@@ -21,8 +21,7 @@ type Fetch struct {
 	MaxBytes  int64 // response body cap; 0 → 1MB
 	Timeout   time.Duration
 	AllowLAN  bool // permit private/loopback targets (dev setups)
-	Client    *http.Client
-	Redirects int // max followed redirects; 0 → 3
+	Redirects int  // max followed redirects; 0 → 3
 }
 
 func (t Fetch) Name() string        { return "fetch" }
@@ -32,26 +31,37 @@ func (t Fetch) Schema() json.RawMessage {
 }
 
 func (t Fetch) client() *http.Client {
-	if t.Client != nil {
-		return t.Client
-	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	tr := &http.Transport{
+		// No pooling — each Call is one-shot; idle conns from
+		// abandoned transports would accumulate otherwise.
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
-			ips, err := dialer.Resolver.LookupNetIP(ctx, "ip", host)
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 			if err != nil {
 				return nil, err
 			}
+			var lastErr error
+			permitted := false
 			for _, ip := range ips {
-				if t.AllowLAN || public(ip) {
-					return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+				if !t.AllowLAN && !public(ip) {
+					continue
 				}
+				permitted = true
+				conn, derr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+				if derr == nil {
+					return conn, nil
+				}
+				lastErr = derr // first candidate dead? try the rest
 			}
-			return nil, fmt.Errorf("tools: fetch target %s resolves to a non-public address", host)
+			if !permitted {
+				return nil, fmt.Errorf("tools: fetch target %s resolves to a non-public address", host)
+			}
+			return nil, fmt.Errorf("tools: fetch dial %s: %w", host, lastErr)
 		},
 	}
 	maxRedir := t.Redirects
@@ -61,7 +71,7 @@ func (t Fetch) client() *http.Client {
 	return &http.Client{
 		Transport: tr,
 		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= maxRedir {
+			if len(via) > maxRedir {
 				return fmt.Errorf("tools: fetch redirect limit %d", maxRedir)
 			}
 			return nil
@@ -69,9 +79,16 @@ func (t Fetch) client() *http.Client {
 	}
 }
 
+// cgnat is shared address space (RFC 6598) — netip.IsPrivate does not
+// cover it, but cloud metadata endpoints (e.g. Alibaba's
+// 100.100.100.200) live there.
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
 func public(ip netip.Addr) bool {
+	ip = ip.Unmap()
 	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() &&
-		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast()
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() &&
+		!ip.IsMulticast() && !cgnat.Contains(ip)
 }
 
 func (t Fetch) Call(ctx context.Context, args json.RawMessage) (any, error) {
