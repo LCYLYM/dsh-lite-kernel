@@ -191,3 +191,41 @@ func TestWriteFileReplacesLinkToFifo(t *testing.T) {
 		t.Fatal("link was not replaced")
 	}
 }
+
+func TestWriteThroughDirLinkThenEditReal(t *testing.T) {
+	dir := t.TempDir()
+	os.Mkdir(filepath.Join(dir, "real"), 0o755)
+	os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "link"))
+	raw, _ := json.Marshal(map[string]any{"path": "link/f.txt", "content": "one"})
+	if _, err := (WriteFile{W: Workspace{Root: dir}}).Call(context.Background(), raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := editCall(t, dir, map[string]any{"path": "real/f.txt", "old": "one", "new": "two"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "link", "f.txt"))
+	if string(got) != "two" {
+		t.Fatalf("write+edit through dir link lost: %q", got)
+	}
+}
+
+func TestReadFileRejectsFifo(t *testing.T) {
+	dir := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(dir, "pipe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{"path": "pipe"})
+	done := make(chan error, 1)
+	go func() {
+		_, err := (ReadFile{W: Workspace{Root: dir}}).Call(context.Background(), raw)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("read on fifo allowed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read blocked on fifo")
+	}
+}

@@ -51,6 +51,9 @@ func (t EditFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if info.IsDir() {
 		return nil, fmt.Errorf("tools: edit_file %q is a directory", a.Path)
 	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("tools: edit_file %q is not a regular file", a.Path)
+	}
 	if info.Size() > editMaxFile {
 		return nil, fmt.Errorf("tools: edit_file %q too large (%d bytes)", a.Path, info.Size())
 	}

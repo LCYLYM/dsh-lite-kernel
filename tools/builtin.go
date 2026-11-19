@@ -30,6 +30,24 @@ func lockPath(p string) func() {
 	return m.Unlock
 }
 
+// lockWrite locks the lexical write path, plus the real path when the
+// rename will land on it — i.e. the leaf is not itself a symlink (an
+// ancestor is, or the file doesn't exist). Replacing a link never
+// touches its target, so the target's lock — possibly held by a stuck
+// reader of a fifo — is skipped in that case.
+func lockWrite(lex, real string) func() {
+	if fi, err := os.Lstat(lex); (err == nil && fi.Mode()&os.ModeSymlink != 0) || real == lex {
+		return lockPath(lex)
+	}
+	a, b := lex, real
+	if a > b {
+		a, b = b, a
+	}
+	u1 := lockPath(a)
+	u2 := lockPath(b)
+	return func() { u2(); u1() }
+}
+
 // resolve returns both forms of p: the lexical absolute path (what
 // write_file should create — a symlink there is REPLACED, never
 // followed) and the real path with symlinks resolved (what
@@ -136,6 +154,13 @@ func (t ReadFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("tools: read_file %q is not a regular file", a.Path)
+	}
 	b, err := os.ReadFile(p)
 	if err != nil {
 		return nil, err
@@ -165,7 +190,7 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	// resolve rejects symlink escapes on the leaf; the parent needs the
 	// same check — a dir symlink could make the lexical rename land
 	// outside even when the leaf's target resolves inside.
-	p, _, err := t.W.resolve(a.Path)
+	p, real, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -175,11 +200,7 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if rootAbs, _ := filepath.Abs(t.W.Root); p == rootAbs {
 		return nil, fmt.Errorf("tools: path %q is the workspace root", a.Path)
 	}
-	// Lock the lexical path only: the write replaces the dir entry and
-	// never touches the symlink target's contents — locking the real
-	// path would block a replacement on a stuck reader of the target
-	// (e.g. a named pipe).
-	unlock := lockPath(p)
+	unlock := lockWrite(p, real)
 	defer unlock()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
