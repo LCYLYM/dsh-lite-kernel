@@ -96,7 +96,7 @@ func (t GrepFile) Schema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"max":{"type":"integer"}},"required":["pattern"]}`)
 }
 
-func (t GrepFile) Call(_ context.Context, args json.RawMessage) (any, error) {
+func (t GrepFile) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	var a struct {
 		Pattern string `json:"pattern"`
 		Path    string `json:"path"`
@@ -121,20 +121,30 @@ func (t GrepFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	hits := []grepHit{}
 	truncated := false
 	if info, _ := os.Stat(root); info != nil && !info.IsDir() {
-		hits = grepOne(root, wsRoot, re, max)
+		if !grepEligible(root) {
+			return map[string]any{"matches": hits, "truncated": false}, nil
+		}
+		var more bool
+		hits, more = grepOne(ctx, root, wsRoot, re, max)
+		truncated = more
 	} else {
 		err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
 				return nil
 			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if len(hits) >= max {
 				truncated = true
 				return filepath.SkipAll
 			}
-			if fi, _ := d.Info(); fi != nil && fi.Size() > 1<<20 {
-				return nil // grep the needle, not the heap
+			if !grepEligible(p) {
+				return nil // non-regular, symlink, or oversized
 			}
-			hits = append(hits, grepOne(p, wsRoot, re, max-len(hits))...)
+			h, more := grepOne(ctx, p, wsRoot, re, max-len(hits))
+			hits = append(hits, h...)
+			truncated = truncated || more
 			return nil
 		})
 	}
@@ -144,10 +154,20 @@ func (t GrepFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	return map[string]any{"matches": hits, "truncated": truncated}, nil
 }
 
-func grepOne(p, wsRoot string, re *regexp.Regexp, max int) []grepHit {
+// grepEligible admits only plain regular files under the size cap —
+// symlinks stay un-followed (a workspace link must not leak external
+// content) and FIFOs are never opened (os.Open on a pipe blocks until
+// a writer connects, hanging the whole turn).
+func grepEligible(p string) bool {
+	fi, err := os.Lstat(p)
+	return err == nil && fi.Mode().IsRegular() && fi.Size() <= 1<<20
+}
+
+// grepOne returns hits plus whether the cap dropped additional matches.
+func grepOne(ctx context.Context, p, wsRoot string, re *regexp.Regexp, max int) ([]grepHit, bool) {
 	f, err := os.Open(p)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	defer f.Close()
 	rel, _ := filepath.Rel(wsRoot, p)
@@ -155,15 +175,21 @@ func grepOne(p, wsRoot string, re *regexp.Regexp, max int) []grepHit {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	ln := 0
-	for sc.Scan() && len(hits) < max {
+	more := false
+	for sc.Scan() && ctx.Err() == nil {
 		ln++
 		line := sc.Text()
-		if re.MatchString(line) {
-			if len(line) > 500 {
-				line = line[:500] + "…"
-			}
-			hits = append(hits, grepHit{rel, ln, line})
+		if !re.MatchString(line) {
+			continue
 		}
+		if len(hits) >= max {
+			more = true // overflow in this file still counts as truncation
+			break
+		}
+		if len(line) > 500 {
+			line = line[:500] + "…"
+		}
+		hits = append(hits, grepHit{rel, ln, line})
 	}
-	return hits
+	return hits, more
 }
