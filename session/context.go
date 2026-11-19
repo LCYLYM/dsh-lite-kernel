@@ -84,7 +84,13 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		default:
 			continue
 		}
+		// Charge the wire message, not the log event — logged fields a
+		// provider never sees (usage counters, finish markers) must not
+		// evict history.
 		size := len(ev.Data)
+		if w, err := json.Marshal(m); err == nil {
+			size = len(w)
+		}
 		if used+size > b.MaxBytes && len(rev) > 0 {
 			break
 		}
