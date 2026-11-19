@@ -120,3 +120,32 @@ func TestWriteFileInitializesMissingWorkspace(t *testing.T) {
 		t.Fatalf("first write in new workspace: %v", err)
 	}
 }
+
+func TestWriteFileDirSymlinkOutside(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "f"), []byte("x"), 0o644)
+	os.Symlink(filepath.Join(dir, "inner.txt"), filepath.Join(outside, "f"))
+	os.Mkdir(filepath.Join(dir, "d"), 0o755)
+	// leaf symlink (dir/f -> ws/inner.txt) living on an external dir
+	os.Symlink(outside, filepath.Join(dir, "d", "ext"))
+	os.Symlink(filepath.Join(outside, "f"), filepath.Join(dir, "d", "ext2"))
+	// dir symlink to outside dir; leaf link -> inside
+	os.Symlink(outside, filepath.Join(dir, "dirlink"))
+	raw, _ := json.Marshal(map[string]any{"path": "dirlink/f", "content": "new"})
+	if _, err := (WriteFile{W: Workspace{Root: dir}}).Call(context.Background(), raw); err == nil {
+		t.Fatal("write through external dir link allowed")
+	}
+}
+
+func TestReadOnMissingWorkspaceLeavesNothing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ghost")
+	raw, _ := json.Marshal(map[string]any{"path": "a.txt"})
+	_, err := (ReadFile{W: Workspace{Root: dir}}).Call(context.Background(), raw)
+	if err == nil {
+		t.Fatal("read should fail")
+	}
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Fatal("read materialized the workspace")
+	}
+}

@@ -30,6 +30,19 @@ func lockPath(p string) func() {
 	return m.Unlock
 }
 
+// lockPaths locks one or two distinct paths in sorted order.
+func lockPaths(a, b string) func() {
+	if a == b {
+		return lockPath(a)
+	}
+	if a > b {
+		a, b = b, a
+	}
+	u1 := lockPath(a)
+	u2 := lockPath(b)
+	return func() { u2(); u1() }
+}
+
 // resolve returns both forms of p: the lexical absolute path (what
 // write_file should create — a symlink there is REPLACED, never
 // followed) and the real path with symlinks resolved (what
@@ -46,12 +59,11 @@ func (w Workspace) resolve(p string) (lex string, real string, err error) {
 		return "", "", fmt.Errorf("tools: path %q escapes the workspace", p)
 	}
 	lexAbs := abs
-	// A missing workspace isn't an error — the first write_file call
-	// must be able to initialize it.
+	// A nonexistent workspace has no symlinks inside it — lexical
+	// containment suffices, and resolve stays side-effect free (a read
+	// must not materialize directories).
 	if _, err := os.Stat(rootAbs); os.IsNotExist(err) {
-		if err := os.MkdirAll(rootAbs, 0o755); err != nil {
-			return "", "", err
-		}
+		return lexAbs, lexAbs, nil
 	}
 	rootReal, err := filepath.EvalSymlinks(rootAbs)
 	if err != nil {
@@ -163,14 +175,19 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, err
 	}
-	// resolve rejects symlink escapes; then we write the LEXICAL path —
-	// a symlink destination is replaced by the new file, so writing a
-	// link never destroys the file it points to.
-	p, _, err := t.W.resolve(a.Path)
+	// resolve rejects symlink escapes on the leaf; the parent needs the
+	// same check — a dir symlink could make the lexical rename land
+	// outside even when the leaf's target resolves inside.
+	p, real, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
-	unlock := lockPath(p)
+	if _, _, err := t.W.resolve(filepath.Dir(a.Path)); err != nil {
+		return nil, err
+	}
+	// Lock lexical and real in stable order — EditFile holds the real
+	// path's lock; both must serialize read-modify-write.
+	unlock := lockPaths(p, real)
 	defer unlock()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
