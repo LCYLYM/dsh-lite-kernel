@@ -30,20 +30,25 @@ type Shell struct {
 	AllowUnsandboxed bool
 }
 
-// sandboxScript runs inside `unshare -rmpf`: build a throwaway root
-// with only toolchain dirs (read-only), the workspace (read-write),
-// private /tmp, and minimal devices, then chroot into it.
-const sandboxScript = `WS="$1"; CMD="$2"; R=/tmp/dshk-root
-mkdir -p "$R"
-for d in bin lib lib64 usr etc; do
-  mkdir -p "$R/$d" && mount --rbind "/$d" "$R/$d" && mount -o remount,bind,ro "$R/$d"
+// sandboxScript runs inside `unshare -rmpf --kill-child`: instead of
+// chroot (escapable by a namespace-root process holding CAP_SYS_CHROOT)
+// it keeps toolchain dirs read-only in place and covers every other
+// top-level directory with an empty read-only tmpfs — nothing
+// host-side stays reachable and there is no shared staging root.
+const sandboxScript = `WS="$1"; CMD="$2"
+mount --bind "$WS" /mnt || exit 3
+for d in bin lib lib32 lib64 libx32 usr etc sbin opt; do
+  [ -d "/$d" ] && mount --bind "/$d" "/$d" && mount -o remount,bind,ro "/$d" || :
 done
-mkdir -p "$R/ws" "$R/tmp" "$R/dev" "$R/proc"
-mount --bind "$WS" "$R/ws" || exit 3
-mount -t tmpfs tmpfs "$R/tmp"
-for d in null zero urandom; do touch "$R/dev/$d" && mount --bind "/dev/$d" "$R/dev/$d"; done
-mount -t proc proc "$R/proc"
-exec chroot "$R" sh -c 'cd /ws && exec sh -c "$1"' _ "$CMD"
+for d in /*; do
+  case "$d" in
+    /bin|/lib|/lib32|/lib64|/libx32|/usr|/etc|/sbin|/opt|/dev|/proc|/mnt) ;;
+    *) mount -t tmpfs -o ro,size=1m tmpfs "$d" 2>/dev/null || : ;;
+  esac
+done
+mount -t tmpfs -o size=4m tmpfs /dev/shm 2>/dev/null || :
+mount -t tmpfs -o size=64m tmpfs /tmp
+exec sh -c 'cd /mnt && exec sh -c "$1"' _ "$CMD"
 `
 
 var (
@@ -53,7 +58,7 @@ var (
 
 func sandboxed() bool {
 	sandboxOnce.Do(func() {
-		sandboxOK = exec.Command("unshare", "-rmpf", "true").Run() == nil
+		sandboxOK = exec.Command("unshare", "-rmpf", "--kill-child", "--mount-proc", "true").Run() == nil
 	})
 	return sandboxOK
 }
@@ -85,13 +90,36 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	cctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
 
-	root, err := filepath.EvalSymlinks(s.W.Root)
+	// Abs first: EvalSymlinks(".") returns "." and a relative bind
+	// source would expose whatever the unshare child starts in.
+	abs, err := filepath.Abs(s.W.Root)
 	if err != nil {
 		return nil, fmt.Errorf("tools: workspace %q: %w", s.W.Root, err)
 	}
+	root := abs
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		root = r
+	} else {
+		// Nonexistent root: resolve the deepest existing ancestor and
+		// rejoin the missing tail, so symlinks in the prefix are still
+		// honored.
+		tail := ""
+		for p := abs; ; {
+			prev := p
+			p = filepath.Dir(p)
+			if p == prev {
+				break
+			}
+			tail = filepath.Join(filepath.Base(prev), tail)
+			if r, err := filepath.EvalSymlinks(p); err == nil {
+				root = filepath.Join(r, tail)
+				break
+			}
+		}
+	}
 	var cmd *exec.Cmd
 	if sandboxed() {
-		cmd = exec.CommandContext(cctx, "unshare", "-rmpf", "--mount-proc",
+		cmd = exec.CommandContext(cctx, "unshare", "-rmpf", "--kill-child", "--mount-proc",
 			"sh", "-c", sandboxScript, "dshk-shell", root, a.Cmd)
 		cmd.Dir = "/"
 	} else if s.AllowUnsandboxed {
