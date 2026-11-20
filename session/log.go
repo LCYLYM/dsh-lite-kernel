@@ -7,8 +7,11 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -34,6 +37,8 @@ type Log struct {
 	subs    map[chan Event]struct{}
 	done    chan struct{}
 	closed  bool
+	compact *Compaction // newest session/compaction marker, if any
+	onClose []func()
 }
 
 // OpenLog opens (or creates) the log at path and rebuilds its offset index.
@@ -43,7 +48,99 @@ func OpenLog(path string) (*Log, error) {
 		return nil, err
 	}
 	l := &Log{f: f, path: path, nextSeq: 1, subs: map[chan Event]struct{}{}, done: make(chan struct{})}
-	sc := bufio.NewScanner(f)
+	fi, _ := f.Stat()
+	var size int64
+	if fi != nil {
+		size = fi.Size()
+	}
+	// ReadBytes keeps raw line endings: offsets, truncation points and the
+	// last-line test all operate on real byte positions — a Scanner would
+	// strip the '\r' of CRLF endings and misplace the truncation cut.
+	r := bufio.NewReaderSize(f, 1<<20)
+	var off int64
+	for {
+		raw, rerr := r.ReadBytes('\n')
+		if len(raw) == 0 {
+			if rerr != nil && rerr != io.EOF {
+				f.Close()
+				return nil, fmt.Errorf("session: corrupt log %s: %w", path, rerr)
+			}
+			break
+		}
+		line := bytes.TrimRight(raw, "\r\n")
+		var ev Event
+		jerr := json.Unmarshal(line, &ev)
+		switch {
+		case jerr == nil && ev.Seq == l.nextSeq:
+			l.offsets = append(l.offsets, off)
+			l.nextSeq++
+			if ev.Type == "session/compaction" {
+				var c Compaction
+				if json.Unmarshal(ev.Data, &c) == nil {
+					l.compact = &c
+				}
+			}
+		case jerr != nil && off+int64(len(raw)) >= size:
+			// Unparseable LAST line: a crash mid-append never committed —
+			// drop the uncommitted tail so later appends don't leave the
+			// garbage embedded in the middle of the log.
+			if err := f.Truncate(off); err != nil {
+				f.Close()
+				return nil, err
+			}
+			size = off
+		default:
+			f.Close()
+			return nil, fmt.Errorf("session: corrupt log %s at seq %d", path, l.nextSeq)
+		}
+		off += int64(len(raw))
+		if rerr != nil {
+			if rerr != io.EOF {
+				f.Close()
+				return nil, fmt.Errorf("session: corrupt log %s: %w", path, rerr)
+			}
+			break
+		}
+	}
+	if _, err := f.Seek(0, 2); err != nil {
+		f.Close()
+		return nil, err
+	}
+	// A valid final event that was never newline-terminated (writer
+	// exited between the data and the '\n') is still committed — but
+	// appending now would glue the next event onto its line. Terminate
+	// it so the log stays well-formed.
+	if size > 0 {
+		if _, err := f.Seek(-1, 2); err != nil {
+			f.Close()
+			return nil, err
+		}
+		var last [1]byte
+		if _, err := f.Read(last[:]); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if last[0] != '\n' {
+			if _, err := f.Write([]byte{'\n'}); err != nil {
+				f.Close()
+				return nil, err
+			}
+		}
+	}
+	return l, nil
+}
+
+// reindex rescans the file after an out-of-band rewrite (Store.Fork
+// copies bytes behind the handle's back).
+func (l *Log) reindex() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, err := l.f.Seek(0, 0); err != nil {
+		return err
+	}
+	l.offsets = l.offsets[:0]
+	l.nextSeq = 1
+	sc := bufio.NewScanner(l.f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	var off int64
 	for sc.Scan() {
@@ -52,18 +149,26 @@ func OpenLog(path string) (*Log, error) {
 		l.nextSeq++
 	}
 	if err := sc.Err(); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("session: corrupt log %s: %w", path, err)
+		return fmt.Errorf("session: corrupt log %s: %w", l.path, err)
 	}
-	if _, err := f.Seek(0, 2); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return l, nil
+	_, err := l.f.Seek(0, 2)
+	return err
 }
 
 // Len returns the number of events.
 func (l *Log) Len() int64 { return l.nextSeq - 1 }
+
+// CompactedThrough is the seq the newest compaction marker covers (0
+// when none exists), kept in memory — O(1), no scan.
+func (l *Log) CompactedThrough() int64 {
+	if l.compact == nil {
+		return 0
+	}
+	return l.compact.ThroughSeq
+}
+
+// NewestCompaction returns the newest compaction marker, or nil.
+func (l *Log) NewestCompaction() *Compaction { return l.compact }
 
 // Append writes an event, fsyncs, and notifies subscribers. Delivery
 // order is seq order; subscribers that lag drop nothing — they replay
@@ -80,7 +185,10 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	off, _ := l.f.Seek(0, 2)
+	off, err := l.f.Seek(0, 2)
+	if err != nil {
+		return Event{}, err
+	}
 	if _, err := l.f.Write(append(line, '\n')); err != nil {
 		return Event{}, err
 	}
@@ -89,6 +197,12 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 	}
 	l.offsets = append(l.offsets, off)
 	l.nextSeq++
+	if typ == "session/compaction" {
+		var c Compaction
+		if json.Unmarshal(raw, &c) == nil {
+			l.compact = &c
+		}
+	}
 	for ch := range l.subs {
 		select {
 		case ch <- ev:
@@ -99,24 +213,43 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 }
 
 // ReadFrom reads events with seq >= after+1, calling fn per event in
-// order, stopping when fn returns false or an error occurs.
+// order, stopping when fn returns false or an error occurs. It reads
+// through a private descriptor: a slow client replaying a large log
+// must not hold l.mu — appends and other reads would stall for the
+// whole scan (the same class of jank upstream reports for big
+// sessions).
 func (l *Log) ReadFrom(after int64, fn func(Event) bool) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.readFrom(after, fn)
-}
-
-func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 	if after < 0 {
 		after = 0
 	}
 	if after >= l.nextSeq-1 {
+		l.mu.Unlock()
 		return nil
 	}
-	if _, err := l.f.Seek(l.offsets[after], 0); err != nil {
+	off := l.offsets[after]
+	fi, statErr := l.f.Stat()
+	l.mu.Unlock()
+	if statErr != nil {
+		return statErr
+	}
+
+	f, err := os.Open(l.path)
+	if err != nil {
 		return err
 	}
-	r := bufio.NewReaderSize(l.f, 1<<20)
+	defer f.Close()
+	if _, err := f.Seek(off, 0); err != nil {
+		return err
+	}
+	// Bound the scan at the snapshot end: events appended mid-replay
+	// belong to the live channel, not to this replay — streaming them
+	// twice produced duplicate ids at the replay/live seam.
+	r := bufio.NewReaderSize(io.LimitReader(f, fi.Size()-off), 1<<20)
+	return readEvents(after, r, fn)
+}
+
+func readEvents(after int64, r *bufio.Reader, fn func(Event) bool) error {
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 {
@@ -125,10 +258,16 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 				if !fn(ev) {
 					return nil
 				}
+			} else if !(err != nil && err.Error() == "EOF") {
+				// A bad line mid-log is corruption — surface it rather
+				// than silently shrinking history. A partial last line
+				// (crash mid-append) is tolerated: it was never
+				// committed.
+				return fmt.Errorf("session: corrupt event after seq %d: %w", after, jerr)
 			}
 		}
 		if err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -138,14 +277,36 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 
 // Tail returns up to n trailing events — O(n), no full scan.
 func (l *Log) Tail(n int) ([]Event, error) {
+	if n <= 0 {
+		return nil, nil
+	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	if l.nextSeq <= 1 {
+		l.mu.Unlock()
+		return nil, nil
+	}
 	start := l.nextSeq - 1 - int64(n)
 	if start < 0 {
 		start = 0
 	}
+	off := l.offsets[start]
+	fi, statErr := l.f.Stat()
+	l.mu.Unlock()
+	if statErr != nil {
+		return nil, statErr
+	}
+
+	f, err := os.Open(l.path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, 0); err != nil {
+		return nil, err
+	}
 	var out []Event
-	err := l.readFrom(start, func(ev Event) bool {
+	r := bufio.NewReaderSize(io.LimitReader(f, fi.Size()-off), 1<<20)
+	err = readEvents(start, r, func(ev Event) bool {
 		out = append(out, ev)
 		return true
 	})
@@ -177,14 +338,30 @@ func (l *Log) Subscribe(buf int) (<-chan Event, func()) {
 // session stops their heartbeat loop instead of pinning the handler.
 func (l *Log) Done() <-chan struct{} { return l.done }
 
-// Close flushes and closes the log file; a second call is a no-op.
+// Close flushes, closes the log file, and runs registered cleanups —
+// indexes keyed on this log (mailbox, projections) release here rather
+// than pinning a closed log forever. A second call is a no-op.
 func (l *Log) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
+		l.mu.Unlock()
 		return nil
 	}
 	l.closed = true
 	close(l.done)
-	return l.f.Close()
+	cbs := l.onClose
+	l.onClose = nil
+	err := l.f.Close()
+	l.mu.Unlock()
+	for _, fn := range cbs {
+		fn()
+	}
+	return err
+}
+
+// OnClose registers fn to run once when Close is called.
+func (l *Log) OnClose(fn func()) {
+	l.mu.Lock()
+	l.onClose = append(l.onClose, fn)
+	l.mu.Unlock()
 }
