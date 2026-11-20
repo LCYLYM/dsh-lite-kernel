@@ -17,6 +17,7 @@ type Guard struct {
 	RepeatThreshold  int // repeats of the same short n-gram that trigger abort
 	MaxOutputChars   int // per-step visible-output cap
 	CallTimeout      int // per provider call, seconds; <=0 disables
+	MaxSessionTokens int // lifetime prompt+completion tokens; 0 = unbounded
 }
 
 func DefaultGuard() Guard {
@@ -27,6 +28,7 @@ func DefaultGuard() Guard {
 		RepeatThreshold:  40,
 		MaxOutputChars:   256 << 10,
 		CallTimeout:      120,
+		MaxSessionTokens: 2_000_000,
 	}
 }
 
