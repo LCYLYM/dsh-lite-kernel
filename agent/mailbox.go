@@ -2,6 +2,8 @@ package agent
 
 import (
 	"encoding/json"
+	"sort"
+	"sync"
 
 	"github.com/LCYLYM/dsh-lite-kernel/session"
 )
@@ -58,10 +60,30 @@ func Pending(lg *session.Log) ([]Notice, error) {
 				delivered[d.ID] = true
 				pending = filterOut(pending, d.ID)
 			}
+		case "mailbox/undeliver":
+			var u struct {
+				Notice Notice `json:"notice"`
+			}
+			if json.Unmarshal(ev.Data, &u) == nil {
+				delivered[u.Notice.ID] = false
+				pending = append(pending, u.Notice)
+			}
 		}
 		return true
 	})
 	return pending, err
+}
+
+// HasPending reports whether undelivered notices wait in the mailbox.
+// The cheap incremental scan runs first so notices appended since the
+// last drain count too — a notice posted during the final provider
+// call must not look like an empty mailbox.
+func HasPending(lg *session.Log) bool {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	_ = mb.scan(lg)
+	return len(mb.pending) > 0
 }
 
 func pendingSet(ns []Notice) map[string]bool {
@@ -80,4 +102,139 @@ func filterOut(ns []Notice, id string) []Notice {
 		}
 	}
 	return out
+}
+
+// mailboxState indexes notices per log: rebuilt once on first drain,
+// then advanced only over newly appended events, so a step's drain
+// costs O(new events) instead of O(history). One mutex serializes the
+// whole select→inject→ack batch — two turns on the same log cannot
+// inject the same notice twice.
+type mailboxState struct {
+	mu        sync.Mutex
+	scanned   int64
+	delivered map[string]bool
+	pending   map[string]Notice
+	injected  []Notice // injected this turn, awaiting its outcome
+}
+
+// maxDrainBatch caps one drain's injection well below any plausible
+// context window — a giant batch would push its own inject event out
+// of the tail window while its acks stayed in, delivering nothing to
+// the model. Notices beyond the cap stay pending for the next step.
+const maxDrainBatch = 64
+
+var mailboxes sync.Map // *session.Log -> *mailboxState
+
+func mailboxFor(lg *session.Log) *mailboxState {
+	m, loaded := mailboxes.LoadOrStore(lg, &mailboxState{
+		delivered: map[string]bool{}, pending: map[string]Notice{},
+	})
+	if !loaded {
+		// The index must not root a closed log forever.
+		lg.OnClose(func() { mailboxes.Delete(lg) })
+	}
+	return m.(*mailboxState)
+}
+
+// scan advances the notice index over events appended since the last
+// call — O(new events), never O(history). Call with mb.mu held.
+func (mb *mailboxState) scan(lg *session.Log) error {
+	last := mb.scanned
+	err := lg.ReadFrom(mb.scanned, func(ev session.Event) bool {
+		last = ev.Seq
+		switch ev.Type {
+		case "mailbox/notice":
+			var n Notice
+			if json.Unmarshal(ev.Data, &n) == nil && !mb.delivered[n.ID] {
+				mb.pending[n.ID] = n
+			}
+		case "mailbox/delivered":
+			var d deliveredData
+			if json.Unmarshal(ev.Data, &d) == nil {
+				delete(mb.pending, d.ID)
+				mb.delivered[d.ID] = true
+			}
+		case "mailbox/undeliver":
+			var u struct {
+				Notice Notice `json:"notice"`
+			}
+			if json.Unmarshal(ev.Data, &u) == nil {
+				delete(mb.delivered, u.Notice.ID)
+				mb.pending[u.Notice.ID] = u.Notice
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	mb.scanned = last
+	return nil
+}
+
+// Drain scans new log events for notices, injects every pending one
+// into the model-visible stream, then acknowledges. The inject event
+// lands BEFORE the acknowledgements: a crash between them replays the
+// notice as a duplicate (deduped for the model by BuildContext), never
+// a silent loss.
+func Drain(lg *session.Log) error {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if err := mb.scan(lg); err != nil {
+		return err
+	}
+	if len(mb.pending) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(mb.pending))
+	for id := range mb.pending {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) > maxDrainBatch {
+		ids = ids[:maxDrainBatch]
+	}
+	arr := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		n := mb.pending[id]
+		arr = append(arr, map[string]any{
+			"id": n.ID, "from": n.From, "kind": n.Kind, "payload": n.Payload,
+		})
+	}
+	if _, err := lg.Append("mailbox/inject", map[string]any{"notices": arr}); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		n := mb.pending[id]
+		if err := Delivered(lg, id); err != nil {
+			return err
+		}
+		delete(mb.pending, id)
+		mb.delivered[id] = true
+		mb.injected = append(mb.injected, n)
+	}
+	return nil
+}
+
+// turnOutcome resolves the notices a drive injected. A turn that fails
+// after acking would otherwise swallow them — the inject sits in the
+// log while nothing ever delivers it again. On failure each one is
+// re-pended AND a mailbox/undeliver record lands in the log so the
+// index rebuilds identically after a restart. Call with the drive's
+// final error; nil just clears the batch.
+func turnOutcome(lg *session.Log, err error) {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if err == nil {
+		mb.injected = nil
+		return
+	}
+	for _, n := range mb.injected {
+		delete(mb.delivered, n.ID)
+		mb.pending[n.ID] = n
+		lg.Append("mailbox/undeliver", map[string]any{"notice": n})
+	}
+	mb.injected = nil
 }
