@@ -123,6 +123,12 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 				if !fn(ev) {
 					return nil
 				}
+			} else if !(err != nil && err.Error() == "EOF") {
+				// A bad line mid-log is corruption — surface it rather
+				// than silently shrinking history. A partial last line
+				// (crash mid-append) is tolerated: it was never
+				// committed.
+				return fmt.Errorf("session: corrupt event after seq %d: %w", after, jerr)
 			}
 		}
 		if err != nil {
