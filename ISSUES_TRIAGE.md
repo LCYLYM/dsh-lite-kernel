@@ -78,3 +78,12 @@ further defects fixed in their own PRs:
 | #30 | `Workspace`/`CreatedAt` lived in memory only — reloads lost them; the id counter restarted at 0 and reused `session-1-1`, appending into the old log | `session/meta` event carries the binding; the seq is seeded from disk and the id is `session-<seq>` |
 | #31 | Events appended mid-replay were delivered twice on the SSE stream (log replay + live channel) | `lastSeq` dedupes across the replay/live seam |
 | #32 | `Tail(0)` returned the last event; `Append` ignored its seek error; EOF detected by string compare | Edge cases corrected |
+| #34 | Child-scope tool shadowing a same-named parent was advertised twice in `Specs` (same root as [#13829](https://github.com/deepseek-ai/deepseek-harness/discussions/13829): multi-preset global-layer name collisions) | First-found wins, matching `Lookup`; non-`Tool` registrations under `tool/` return an error instead of panicking |
+| #35 | [#13822](https://github.com/deepseek-ai/deepseek-harness/discussions/13822): reasoning-only/empty `stop` responses bypass EMPTY_RESPONSE retry and complete silently | Empty reply → retryable `CallError`; stays empty → `Waiting` (logged, resumable); nothing empty reaches the log |
+
+Second triage pass over newer discussions — already benign in the lite kernel:
+
+- [#13842](https://github.com/deepseek-ai/deepseek-harness/discussions/13842) one corrupt JSONL aborts the whole listing → `Store.List` only ever returns live sessions; a corrupt file fails loud on `Get`, never kills the list.
+- [#13834](https://github.com/deepseek-ai/deepseek-harness/discussions/13834) legacy `turn/end` without `reason` breaks projection → no turn/end projection exists; events are only filtered during context assembly.
+- [#13840](https://github.com/deepseek-ai/deepseek-harness/discussions/13840), [#13826](https://github.com/deepseek-ai/deepseek-harness/discussions/13826), [#13827](https://github.com/deepseek-ai/deepseek-harness/discussions/13827) renderer OOM / jank on long sessions → same class as the bounded-log design (#13639, #13717).
+- [#13829](https://github.com/deepseek-ai/deepseek-harness/discussions/13829) presets colliding in a global tool layer → scoped `kernel.Scope` registration (#13710); residual spec-level dedupe fixed in #34.
