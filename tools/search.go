@@ -36,7 +36,7 @@ func (t ListFiles) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, err
 	}
-	root, err := t.W.resolve(a.Path)
+	_, root, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func (t GrepFile) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tools: grep: %w", err)
 	}
-	root, err := t.W.resolve(a.Path)
+	_, root, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}

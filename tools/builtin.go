@@ -8,61 +8,138 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 )
 
 // Workspace confines all file tools to Root.
 type Workspace struct{ Root string }
 
-func (w Workspace) resolve(p string) (string, error) {
-	rootAbs, err := filepath.Abs(w.Root)
-	if err != nil {
-		return "", err
-	}
-	abs, err := filepath.Abs(filepath.Clean(filepath.Join(w.Root, p)))
-	if err != nil {
-		return "", err
-	}
-	rootReal, err := realPath(rootAbs)
-	if err != nil {
-		return "", err
-	}
-	abs, err = realPath(abs)
-	if err != nil {
-		return "", err
-	}
-	if abs != rootReal && !strings.HasPrefix(abs, rootReal+string(os.PathSeparator)) {
-		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
-	}
-	return abs, nil
+// fileMu serializes read-modify-write and write ops per resolved path —
+// concurrent tool calls must not restore stale snapshots over each
+// other's committed results.
+var fileMu sync.Map // resolved abs path -> *sync.Mutex
+
+func lockPath(p string) func() {
+	mu, _ := fileMu.LoadOrStore(p, &sync.Mutex{})
+	m := mu.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
 }
 
-// realPath resolves symlinks along p. EvalSymlinks fails on paths that
-// don't exist yet (a new file or a not-yet-created workspace), so walk
-// to the deepest existing ancestor, resolve it, and rejoin the tail.
-func realPath(p string) (string, error) {
-	var tail []string
-	for {
-		if _, err := os.Lstat(p); err == nil {
-			real, rerr := filepath.EvalSymlinks(p)
-			if rerr != nil {
-				return "", rerr
-			}
-			for i := len(tail) - 1; i >= 0; i-- {
-				real = filepath.Join(real, tail[i])
-			}
-			return real, nil
-		}
-		parent := filepath.Dir(p)
-		if parent == p {
-			return "", fmt.Errorf("tools: cannot resolve %q", p)
-		}
-		tail = append(tail, filepath.Base(p))
-		p = parent
+// lockWrite locks the lexical write path, plus the real path when the
+// rename will land on it — i.e. the leaf is not itself a symlink (an
+// ancestor is, or the file doesn't exist). Replacing a link never
+// touches its target, so the target's lock — possibly held by a stuck
+// reader of a fifo — is skipped in that case.
+func lockWrite(lex, real string) func() {
+	if fi, err := os.Lstat(lex); (err == nil && fi.Mode()&os.ModeSymlink != 0) || real == lex {
+		return lockPath(lex)
 	}
+	a, b := lex, real
+	if a > b {
+		a, b = b, a
+	}
+	u1 := lockPath(a)
+	u2 := lockPath(b)
+	return func() { u2(); u1() }
+}
+
+// resolve returns both forms of p: the lexical absolute path (what
+// write_file should create — a symlink there is REPLACED, never
+// followed) and the real path with symlinks resolved (what
+// read_file/edit_file should touch — an in-workspace link to an
+// external file is rejected).
+func (w Workspace) resolve(p string) (lex string, real string, err error) {
+	clean := filepath.Clean(filepath.Join(w.Root, p))
+	abs, err := filepath.Abs(clean)
+	if err != nil {
+		return "", "", err
+	}
+	rootAbs, _ := filepath.Abs(w.Root)
+	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("tools: path %q escapes the workspace", p)
+	}
+	lexAbs := abs
+	// A nonexistent workspace has no symlinks inside it — lexical
+	// containment suffices, and resolve stays side-effect free (a read
+	// must not materialize directories).
+	if _, err := os.Stat(rootAbs); os.IsNotExist(err) {
+		return lexAbs, lexAbs, nil
+	}
+	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", "", err
+	}
+	probe, rest := abs, ""
+	for {
+		if realp, err := filepath.EvalSymlinks(probe); err == nil {
+			abs = filepath.Join(realp, rest)
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", "", fmt.Errorf("tools: path %q unresolvable", p)
+		}
+		rest = filepath.Join(filepath.Base(probe), rest)
+		probe = parent
+	}
+	if abs != rootReal && !strings.HasPrefix(abs, rootReal+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("tools: path %q escapes the workspace", p)
+	}
+	return lexAbs, abs, nil
+}
+
+// writeAtomic writes data to a unique temp file next to p and renames —
+// a failed write can never leave p truncated, and the temp is removed
+// when the rename fails. preserve, when non-nil, keeps the original
+// file's uid/gid/mode; without it the file gets mode + caller's ids.
+// A chown failure fails the write loudly rather than exposing content
+// to a different group with the original's permission bits.
+func writeAtomic(p string, data []byte, mode os.FileMode, preserve os.FileInfo) error {
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	cleanup := func(err error) error {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if preserve != nil {
+		st, ok := preserve.Sys().(*syscall.Stat_t)
+		if !ok {
+			return cleanup(fmt.Errorf("tools: cannot stat %q", p))
+		}
+		if err := tmp.Chown(int(st.Uid), int(st.Gid)); err != nil {
+			return cleanup(fmt.Errorf("tools: cannot preserve ownership of %q: %w", p, err))
+		}
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		return cleanup(err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return cleanup(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return cleanup(err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(p)); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // ReadFile reads a file inside the workspace.
@@ -80,39 +157,23 @@ func (t ReadFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, err
 	}
-	p, err := t.W.resolve(a.Path)
+	_, p, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
-	// Check size before reading: allocating the file first and
-	// rejecting it afterward defeats the point of the cap — a huge
-	// file would still grow the heap to its full size.
-	// Stat before Open: opening a fifo blocks until a writer appears,
-	// so the non-regular check must come first.
-	fi, err := os.Stat(p)
+	info, err := os.Stat(p)
 	if err != nil {
 		return nil, err
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("tools: %q is not a regular file", a.Path)
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("tools: read_file %q is not a regular file", a.Path)
 	}
-	if fi.Size() > 1<<20 {
-		return map[string]any{"error": "file exceeds 1 MiB read cap", "bytes": fi.Size()}, nil
-	}
-	f, err := os.Open(p)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	// The +1 byte distinguishes "exactly at cap" from "grew past the
-	// stat": a file that expanded or under-reported its size still
-	// returns the cap error rather than silent truncation.
-	b, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return nil, err
 	}
 	if len(b) > 1<<20 {
-		return map[string]any{"error": "file exceeds 1 MiB read cap"}, nil
+		return map[string]any{"error": "file exceeds 1 MiB read cap", "bytes": len(b)}, nil
 	}
 	return string(b), nil
 }
@@ -133,101 +194,28 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, err
 	}
-	p, err := t.W.resolve(a.Path)
+	// resolve rejects symlink escapes on the leaf; the parent needs the
+	// same check — a dir symlink could make the lexical rename land
+	// outside even when the leaf's target resolves inside.
+	p, real, err := t.W.resolve(a.Path)
 	if err != nil {
 		return nil, err
 	}
-	wsRoot, err := filepath.Abs(t.W.Root)
-	if err != nil {
+	if _, _, err := t.W.resolve(filepath.Dir(a.Path)); err != nil {
 		return nil, err
 	}
+	if rootAbs, _ := filepath.Abs(t.W.Root); p == rootAbs {
+		return nil, fmt.Errorf("tools: path %q is the workspace root", a.Path)
+	}
+	unlock := lockWrite(p, real)
+	defer unlock()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
 	}
-	if err := writeAtomic(p, wsRoot, []byte(a.Content)); err != nil {
+	if err := writeAtomic(p, []byte(a.Content), 0o600, nil); err != nil {
 		return nil, err
 	}
 	return map[string]any{"path": p}, nil
-}
-
-// writeAtomic stages the content in a sibling temp file, fsyncs it,
-// renames over the target, and fsyncs every directory between the file
-// and wsRoot so freshly created path components survive a host crash
-// too. Directory handles are opened before the rename — a dir that
-// can't be opened fails before the file changes, so an acknowledged
-// failure never masks a successful write. Two writers never share a
-// temp name.
-func writeAtomic(path, wsRoot string, data []byte) error {
-	type dirFD struct {
-		path string
-		f    *os.File
-	}
-	var dirs []dirFD
-	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
-		d, err := os.Open(dir)
-		if err != nil {
-			for _, f := range dirs {
-				f.f.Close()
-			}
-			return fmt.Errorf("tools: open dir %q: %w", dir, err)
-		}
-		dirs = append(dirs, dirFD{dir, d})
-		if dir == wsRoot {
-			break
-		}
-		if parent := filepath.Dir(dir); parent == dir {
-			break
-		}
-	}
-	defer func() {
-		for _, d := range dirs {
-			d.f.Close()
-		}
-	}()
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	for _, d := range dirs {
-		f := d.f
-		// The directory may have been replaced between open and rename;
-		// the open fd would then sync a stale inode. Reopen the current
-		// path when it no longer names the same directory.
-		if cur, err := os.Open(d.path); err == nil {
-			ci, _ := cur.Stat()
-			oi, _ := f.Stat()
-			if ci != nil && oi != nil && !os.SameFile(ci, oi) {
-				f.Close()
-				f = cur
-			} else {
-				cur.Close()
-			}
-		}
-		if err := f.Sync(); err != nil {
-			f.Close()
-			return fmt.Errorf("tools: sync dir %q: %w", d.path, err)
-		}
-		if f != d.f {
-			f.Close()
-		}
-	}
-	return nil
 }
 
 // Echo returns its input — the smoke-test tool.
