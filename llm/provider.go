@@ -187,7 +187,11 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req *Request) (*Response,
 	}
 	var orr openaiResponse
 	if err := json.Unmarshal(body, &orr); err != nil {
-		return nil, fmt.Errorf("llm: undecodable response: %w", err)
+		// A malformed body — e.g. one tool call carrying an illegal JSON
+		// escape — fails the turn permanently upstream (#13803). A bad
+		// wire frame is not a state we asked for, so retry it like any
+		// other transient fault instead of dying on the spot.
+		return nil, &CallError{Kind: KindTransient, Message: fmt.Sprintf("llm: undecodable response: %v", err)}
 	}
 	if len(orr.Choices) == 0 {
 		return nil, &CallError{Kind: KindTransient, Message: "llm: provider returned no choices"}
