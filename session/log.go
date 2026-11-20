@@ -8,7 +8,9 @@ package session
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -78,7 +80,10 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	off, _ := l.f.Seek(0, 2)
+	off, err := l.f.Seek(0, 2)
+	if err != nil {
+		return Event{}, err
+	}
 	if _, err := l.f.Write(append(line, '\n')); err != nil {
 		return Event{}, err
 	}
@@ -126,7 +131,7 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 			}
 		}
 		if err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -136,6 +141,9 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 
 // Tail returns up to n trailing events — O(n), no full scan.
 func (l *Log) Tail(n int) ([]Event, error) {
+	if n <= 0 {
+		return nil, nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	start := l.nextSeq - 1 - int64(n)
