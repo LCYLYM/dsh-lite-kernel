@@ -16,7 +16,7 @@ are noise. Each accepted item names the design answer in this repo.
 | [#13659](https://github.com/deepseek-ai/deepseek-harness/discussions/13659) | Model loops "做。做。…" — 97k chars, 0 tool calls, host marks `completed` | Real; the costliest class of bug — it does not error | `agent.Guard` does n-gram repetition detection plus a zero-tool-call streak cap; the turn ends `aborted` with the reason logged (`agent/guard.go`, `agent/loop.go`). |
 | [#13621](https://github.com/deepseek-ai/deepseek-harness/discussions/13621) | Unattended goal turn goes silently idle after the retry budget is spent | Real | Retry exhaustion ends the turn in an explicit **`waiting`** state written to the log; `AutoResume` re-drives with capped backoff. Silent-idle is impossible (`agent/loop.go`). |
 | [#13639](https://github.com/deepseek-ai/deepseek-harness/discussions/13639) | One long session costs hundreds of MB: full-history restore + repeated `structuredClone` | Real, matches our design goal | The log keeps an int64 offset index (~8 B/event). `BuildContext` tail-scans under a byte cap — 50k-event session builds context in ~9 ms / 4 MiB, independent of history size (`session/`). |
-| [#13656](https://github.com/deepseek-ai/deepseek-harness/discussions/13656) | Subagent completion notice silently lost when the parent is idle | Real, deadlocks delegation trees | Mailbox notices are appended to the recipient's durable log before delivery; `Pending()` replays unacked notices on resume (`agent/mailbox.go`). |
+| [#13656](https://github.com/deepseek-ai/deepseek-harness/discussions/13656) | Subagent completion notice silently lost when the parent is idle | Real, deadlocks delegation trees | Mailbox notices are appended to the recipient's durable log before delivery; `Drain` consumes them **mid-turn** at every step (inject-before-ack, crash replays as an invisible dedup), and a notice landing on an idle session kicks `Loop.Resume` — the parent wakes instead of waiting for the next keystroke (`agent/mailbox.go`, `agent/loop.go`, `server/server.go`). |
 | [#13647](https://github.com/deepseek-ai/deepseek-harness/discussions/13647) | "继续" after max-tokens is a stateless re-run; truncated reasoning output carries nothing forward | Real, well-diagnosed | Truncated assistant output is committed with `truncated=true`; the next request carries the partial output plus an explicit continue instruction (`agent/loop.go`, `session/context.go`). |
 | [#13715](https://github.com/deepseek-ai/deepseek-harness/discussions/13715) | Empty retry-marker user message poisons strict providers (permanent 400s) | Real | Retry markers are control metadata; `BuildContext` never serializes them as user messages. |
 | [#13742](https://github.com/deepseek-ai/deepseek-harness/discussions/13742) | 429 TPM throttle misclassified as `QUOTA` → turn aborts | Real | `llm.Classify`: HTTP 429 is `RATE_LIMIT` regardless of what the body calls it; honors `Retry-After` (`llm/errors.go`). |
@@ -29,6 +29,31 @@ are noise. Each accepted item names the design answer in this repo.
 | [#13675](https://github.com/deepseek-ai/deepseek-harness/discussions/13675) | Host process permanently deleted ~86k files under `%USERPROFILE%` | Catastrophic, real | There is **no delete tool**. File tools resolve paths inside the workspace and reject escapes (`tools/builtin.go`). |
 | [#13638](https://github.com/deepseek-ai/deepseek-harness/discussions/13638) | `ask_user_question` self-excited loop after toolset loss | Real | Tool loss can't corrupt a turn: specs are read from the scope each step; a zero-progress streak aborts. |
 | [#13617](https://github.com/deepseek-ai/deepseek-harness/discussions/13617) | `dsh web` burns ~1.2 CPU cores forever when the profile dir is deleted | Real upstream; moot here | No fs-watching exists in the lite kernel — documented absence, not a fix. |
+
+## Hardening landed after the first pass
+
+Defects found in design review of this kernel — same class of bugs the
+community reports above, caught before they shipped:
+
+- **Session log integrity**: corrupt mid-log lines or seq gaps fail loud at
+  open; a partial crash tail is truncated as an uncommitted append
+  (`session/log.go`, PR #14, #21).
+- **Concurrent turns on one log** interleave events — second caller gets
+  `ErrTurnBusy`; the server maps busy to `409` and drops the loop cache
+  when a turn ends (PR #16, #17).
+- **Two processes sharing a store dir** interleave `jsonl` — the second
+  `NewStore` gets an exclusive-flock error, not a corrupted log (PR #13).
+- **SSE subscriber-buffer overflow** dropped live events; the stream now
+  refills gaps from the durable log by seq (PR #19).
+- **Provider calls unbounded** — `Guard.CallTimeout` per call; an inner
+  deadline classifies `TIMEOUT` (retryable → `waiting`), not a fatal
+  turn (PR #18).
+- **Tool results unbounded** — capped before hitting the log
+  (`Guard.MaxToolResultChars`), truncation is model-visible (PR #20).
+- **Symlink/FS edge cases in file tools** — escapes through link
+  ancestors rejected, FIFOs rejected before read (a FIFO open blocks
+  forever), uid/gid preserved on edit, write locks track where the
+  rename actually lands (PR #11, #12).
 
 ## Valid but out of kernel scope (UI/app-layer, packaging, platform)
 
