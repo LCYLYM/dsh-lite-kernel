@@ -12,7 +12,10 @@ import (
 
 func shellCall(t *testing.T, cmd string) map[string]any {
 	t.Helper()
-	s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second}
+	// AllowUnsandboxed so hosts without user namespaces (CI runners)
+	// still exercise the shell; confinement has its own test, which
+	// skips there instead of faking a sandbox.
+	s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second, AllowUnsandboxed: true}
 	args, _ := json.Marshal(map[string]string{"cmd": cmd})
 	out, err := s.Call(context.Background(), args)
 	if err != nil {
@@ -37,6 +40,9 @@ func TestShellRunsInWorkspace(t *testing.T) {
 // flag-based deletion, and absolute-path escapes all hit the namespace,
 // not a regex.
 func TestShellConfined(t *testing.T) {
+	if !sandboxed() {
+		t.Skip("user namespaces disabled — no sandbox to confine in")
+	}
 	dir := t.TempDir()
 	out := t.TempDir()
 	secret := filepath.Join(out, "secret.txt")
@@ -118,7 +124,7 @@ func TestShellTimeout(t *testing.T) {
 }
 
 func TestShellOutputCap(t *testing.T) {
-	s := Shell{W: Workspace{Root: t.TempDir()}, MaxOutput: 100, Timeout: 3 * time.Second}
+	s := Shell{W: Workspace{Root: t.TempDir()}, MaxOutput: 100, Timeout: 3 * time.Second, AllowUnsandboxed: true}
 	args, _ := json.Marshal(map[string]string{"cmd": "yes | head -1000"})
 	out, err := s.Call(context.Background(), args)
 	if err != nil {
