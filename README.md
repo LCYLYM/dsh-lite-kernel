@@ -46,7 +46,18 @@ Everything in [ISSUES_TRIAGE.md](ISSUES_TRIAGE.md). Highlights:
 - **Durable mailbox** — cross-agent notices are log entries, replayed on
   resume; nothing is lost while a parent idles.
 - **No delete tool, workspace-confined file ops** — the kernel cannot
-  erase anything outside its workspace.
+  erase anything outside its workspace; symlink escapes resolve to the
+  real path and are rejected.
+- **Sandboxed shell** — commands run in a user/mount/net namespace:
+  private mounts, no network by default (`DSHK_SHELL_NET` opts in),
+  credential-ish env vars scrubbed, `setpriv` drops the bounding set.
+- **Bounded tool output** — every tool result is truncated to 64 KiB
+  before it can flood the context budget.
+- **Graceful shutdown** — SIGINT/SIGTERM drains requests (≤5 s), then
+  `Store.Close` flushes every live log.
+- **Token accounting** — every call lands a `turn/usage` event;
+  `GET /sessions/{id}/usage` aggregates it and `MaxSessionTokens`
+  (default 2M) aborts a runaway session at budget, not at the bill.
 - **Schemas pass through verbatim** — `anyOf`/`oneOf` unions survive.
 
 ## Layout
@@ -54,13 +65,15 @@ Everything in [ISSUES_TRIAGE.md](ISSUES_TRIAGE.md). Highlights:
 ```
 kernel/    plugin lifecycle: scoped effects, LIFO disposal
 llm/       provider seam, error classification, retry policy
-session/   append-only JSONL log, offset index, bounded context
-agent/     loop, guard, tool registry, durable mailbox
-mcp/       stdio MCP client with initialize timeout
+session/   append-only JSONL log, offset index, bounded context,
+           deterministic compaction, stream-copy fork, store flock
+agent/     loop, guard, tool registry, durable mailbox, plan tool
+mcp/       stdio MCP client: per-id dispatch, init timeout
 server/    HTTP + SSE: sessions, turns, resumable event stream
-tools/     echo / read_file / write_file (workspace-confined)
+tools/     echo, read/write/edit_file, list_files, grep, fetch
+           (SSRF-checked), sandboxed shell — all workspace-confined
 bench/     memory + concurrency benchmarks
-cmd/dshk/  the binary
+cmd/dshk/  the binary (serve, run, and a client for every endpoint)
 ```
 
 ## Run
@@ -70,16 +83,48 @@ go build -o dshk ./cmd/dshk
 
 # Headless turn (EchoProvider — no API key needed)
 ./dshk run "say hi"
+./dshk run -session session-1-1 "continue"   # resume a session
 
 # Server
 ./dshk serve -addr 127.0.0.1:3080 -data .dshk/sessions -workspace /path/to/ws
-curl -X POST localhost:3080/v1/sessions -d '{"workspace":"/path/to/ws"}'
-curl -X POST localhost:3080/v1/sessions/session-1-1/messages -d '{"text":"hi"}'
-curl -N "localhost:3080/v1/sessions/session-1-1/events?after_seq=0"   # SSE, resumable
+```
+
+Every endpoint has a `dshk` subcommand against a running daemon
+(`DSHK_ADDR`, `DSHK_TOKEN`; plain HTTP is refused for non-loopback
+targets unless `DSHK_INSECURE=1`):
+
+```sh
+dshk ls                     # sessions on disk
+dshk msg <id> hello there   # post a message (all args join)
+dshk notice <id> [-nowake]  # mailbox notice; -nowake = wake:false
+dshk fork <id>              # stream-copy clone
+dshk cancel <id>            # abort the in-flight turn
+dshk tail <id> [n]          # last n events
+dshk history <id> [after]   # paged reads without SSE
+dshk usage <id>             # aggregated token usage
+dshk rm <id>                # delete
+```
+
+HTTP surface:
+
+```
+POST   /v1/sessions                     create
+GET    /v1/sessions                     list (disk + live)
+GET    /v1/sessions/{id}                workspace + created_at
+POST   /v1/sessions/{id}/messages       run a turn (409 while busy)
+GET    /v1/sessions/{id}/events         SSE; ?after_seq= & ?types=
+GET    /v1/sessions/{id}/history        paged JSON events
+GET    /v1/sessions/{id}/tail?n=        lazy tail for long sessions
+POST   /v1/sessions/{id}/notices        mailbox notice {payload, wake}
+GET    /v1/sessions/{id}/usage          token totals
+POST   /v1/sessions/{id}/fork           stream-copy clone
+POST   /v1/sessions/{id}/cancel         abort in-flight turn
+DELETE /v1/sessions/{id}                remove (idempotent)
 ```
 
 Real model: set `DEEPSEEK_API_KEY` (or `OPENAI_API_KEY`), optionally
-`DSHK_BASE_URL` / `DSHK_MODEL`.
+`DSHK_BASE_URL` / `DSHK_MODEL`. Provider calls carry the session id as
+the OpenAI `user` field so API gateways can correlate them.
 
 ## Test
 
