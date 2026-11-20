@@ -123,12 +123,19 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			zeroTool = 0
 		}
 
+		cancelled := false
 		for _, tc := range resp.Message.ToolCalls {
 			// A cancelled turn must not run the remaining tools — a file
 			// write after /cancel would still land (review finding).
+			// Skip the call but still log a result: a dangling call in
+			// history makes strict providers reject every later request.
 			if err := ctx.Err(); err != nil {
-				l.Log.Append("turn/end", map[string]any{"reason": "cancelled", "error": err.Error()})
-				return Aborted, err
+				cancelled = true
+				l.Log.Append("tool/result", map[string]any{
+					"tool_call_id": tc.ID, "name": tc.Name,
+					"content": map[string]any{"error": "cancelled before execution"}, "error": true,
+				})
+				continue
 			}
 			l.Log.Append("tool/call", map[string]any{"id": tc.ID, "name": tc.Name})
 			out, terr := l.Registry.Call(ctx, tc)
@@ -138,6 +145,10 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			l.Log.Append("tool/result", map[string]any{
 				"tool_call_id": tc.ID, "name": tc.Name, "content": out, "error": terr != nil,
 			})
+		}
+		if cancelled {
+			l.Log.Append("turn/end", map[string]any{"reason": "cancelled", "error": ctx.Err().Error()})
+			return Aborted, ctx.Err()
 		}
 
 		if truncated {
