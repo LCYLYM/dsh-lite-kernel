@@ -96,48 +96,56 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 	// tool/result leaves a dangling call in the log; strict providers
 	// require a result per call and would reject every later request,
 	// bricking the session (upstream #13790). Synthesize an
-	// interrupted-marker result directly after the call.
+	// interrupted-marker result directly after the call, bounded by a
+	// small synthesis reserve; a call that would not fit is dropped
+	// from the message instead so the request stays valid.
 	results := map[string]bool{}
 	for _, m := range rev {
 		if m.Role == "tool" {
 			results[m.ToolCallID] = true
 		}
 	}
+	synthBytes, synthCount := 0, 0
+	synthByteCap := b.MaxBytes / 4
+	if synthByteCap > 64<<10 {
+		synthByteCap = 64 << 10
+	}
+	synthMax := b.MaxEvents / 4
+	if synthMax < 4 {
+		synthMax = 4
+	}
 	for i := len(rev) - 1; i >= 0; i-- {
 		m := rev[i]
-		msgs = append(msgs, m)
-		count++
-		if m.Role != "assistant" {
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			msgs = append(msgs, m)
 			continue
 		}
+		var keptCalls []llm.ToolCall
+		var synths []llm.Message
 		for _, tc := range m.ToolCalls {
 			if results[tc.ID] {
+				keptCalls = append(keptCalls, tc)
 				continue
 			}
-			synth := llm.Message{
+			est := len(tc.ID) + 128
+			if synthBytes+est > synthByteCap || synthCount+1 > synthMax {
+				continue // drop the call rather than exceed the reserve
+			}
+			synthBytes += est
+			synthCount++
+			synths = append(synths, llm.Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Content:    "[tool call was interrupted before it produced a result]",
-			}
-			// Synthesized results spend the same budget; a call that
-			// would not fit is dropped from the message instead, which
-			// keeps the request valid without exceeding the limits.
-			est := len(tc.ID) + 128
-			if used+est > b.MaxBytes || count+1 > b.MaxEvents {
-				var keep []llm.ToolCall
-				for _, tc2 := range m.ToolCalls {
-					if tc2.ID != tc.ID {
-						keep = append(keep, tc2)
-					}
-				}
-				m.ToolCalls = keep
-				msgs[len(msgs)-1] = m
-				continue
-			}
-			msgs = append(msgs, synth)
-			used += est
-			count++
+			})
+			keptCalls = append(keptCalls, tc)
 		}
+		m.ToolCalls = keptCalls
+		if len(keptCalls) == 0 && m.Content == nil {
+			continue // an empty assistant carries nothing the model needs
+		}
+		msgs = append(msgs, m)
+		msgs = append(msgs, synths...)
 	}
 	if b.SystemText != "" {
 		msgs = append([]llm.Message{{Role: "system", Content: b.SystemText}}, msgs...)
