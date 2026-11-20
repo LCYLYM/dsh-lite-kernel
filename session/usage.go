@@ -12,9 +12,11 @@ type UsageTotal struct {
 }
 
 // Usage sums turn/usage events — O(log), only over the offset index.
-func Usage(lg *Log) UsageTotal {
+// The read error propagates: a partial total must never pass for a
+// complete accounting (billing, budget checks).
+func Usage(lg *Log) (UsageTotal, error) {
 	var u UsageTotal
-	_ = lg.ReadFrom(0, func(ev Event) bool {
+	err := lg.ReadFrom(0, func(ev Event) bool {
 		if ev.Type != "assistant/message" {
 			return true
 		}
@@ -29,5 +31,5 @@ func Usage(lg *Log) UsageTotal {
 		}
 		return true
 	})
-	return u
+	return u, err
 }

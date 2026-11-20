@@ -121,7 +121,12 @@ func (s *Server) getUsage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, session.Usage(ses.Log))
+	u, err := session.Usage(ses.Log)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, u)
 }
 
 // history pages events without SSE: ?after=<seq>&limit=<n> (default
