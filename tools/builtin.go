@@ -69,9 +69,15 @@ func (t ReadFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	defer f.Close()
+	// The +1 byte distinguishes "exactly at cap" from "grew past the
+	// stat": a file that expanded or under-reported its size still
+	// returns the cap error rather than silent truncation.
 	b, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(b) > 1<<20 {
+		return map[string]any{"error": "file exceeds 1 MiB read cap"}, nil
 	}
 	return string(b), nil
 }
