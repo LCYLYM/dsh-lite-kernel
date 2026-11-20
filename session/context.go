@@ -2,6 +2,8 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
 )
@@ -47,8 +49,20 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		return nil, err
 	}
 	var rev []llm.Message
+	// The newest compaction marker is the history floor: events with
+	// seq <= ThroughSeq are folded; the retained tail between ThroughSeq
+	// and the marker is ordinary history and must still be kept. The
+	// floor comes from the log's in-memory cursor, so the summary is
+	// available even when the budget exhausts before the scan reaches
+	// the marker.
+	floor := lg.CompactedThrough()
+	comp := lg.NewestCompaction()
+	seenNotices := map[string]bool{}
 	for i := len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
 		ev := tail[i]
+		if ev.Seq <= floor {
+			break
+		}
 		var me messageEvent
 		var m llm.Message
 		switch ev.Type {
@@ -81,10 +95,45 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 				continue
 			}
 			m = llm.Message{Role: "tool", Content: me.Content, ToolCallID: me.ToolCallID}
+		case "mailbox/inject":
+			var inj struct {
+				Notices []struct {
+					ID      string          `json:"id"`
+					From    string          `json:"from"`
+					Kind    string          `json:"kind"`
+					Payload json.RawMessage `json:"payload"`
+				} `json:"notices"`
+			}
+			if err := json.Unmarshal(ev.Data, &inj); err != nil || len(inj.Notices) == 0 {
+				continue
+			}
+			var sb strings.Builder
+			for _, n := range inj.Notices {
+				// A crash between inject and ack reinjects the notice on
+				// resume — render each id once so duplicates stay invisible.
+				// ID-less notices are never deduped: "" would merge them all.
+				if n.ID != "" {
+					if seenNotices[n.ID] {
+						continue
+					}
+					seenNotices[n.ID] = true
+				}
+				fmt.Fprintf(&sb, "[mailbox notice from %s (%s)] %s\n", n.From, n.Kind, n.Payload)
+			}
+			if sb.Len() == 0 {
+				continue
+			}
+			m = llm.Message{Role: "user", Content: strings.TrimRight(sb.String(), "\n")}
 		default:
 			continue
 		}
+		// Charge the wire message, not the log event — logged fields a
+		// provider never sees (usage counters, finish markers) must not
+		// evict history.
 		size := len(ev.Data)
+		if w, err := json.Marshal(m); err == nil {
+			size = len(w)
+		}
 		if used+size > b.MaxBytes && len(rev) > 0 {
 			break
 		}
@@ -95,8 +144,13 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 	for i := len(rev) - 1; i >= 0; i-- {
 		msgs = append(msgs, rev[i])
 	}
-	if b.SystemText != "" {
-		msgs = append([]llm.Message{{Role: "system", Content: b.SystemText}}, msgs...)
+	sys := b.SystemText
+	if comp != nil {
+		sys += fmt.Sprintf("\n[earlier history compacted: %d events folded at seq %d; first request was %q; tools used so far: %s]",
+			comp.Dropped, comp.ThroughSeq, comp.FirstUser, strings.Join(comp.ToolNames, ", "))
+	}
+	if sys != "" {
+		msgs = append([]llm.Message{{Role: "system", Content: sys}}, msgs...)
 	}
 	return msgs, nil
 }
