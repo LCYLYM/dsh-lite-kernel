@@ -240,10 +240,11 @@ func benignShellConfig(u, val string, net bool) bool {
 		}
 	}
 	if !net {
-		// A file:// module mirror (or "off") works without the
-		// network and cannot carry remote credentials.
-		return u == "GOPROXY" &&
-			(strings.HasPrefix(val, "file://") || val == "off")
+		// GOPROXY is a comma/pipe-separated list; keep it only
+		// when every entry is offline-safe — a local file mirror
+		// or a keyword — so a credentialed remote entry can never
+		// ride along behind a benign first entry.
+		return u == "GOPROXY" && offlineSafeProxyList(val)
 	}
 	// Go module config selects mirrors and private-module rules;
 	// dropping GONOPROXY/GOPRIVATE while keeping GOPROXY sends
@@ -299,3 +300,19 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 func (b *limitedBuffer) String() string { return b.buf.String() }
+
+// offlineSafeProxyList reports whether every GOPROXY entry works
+// without the network and cannot carry credentials: file:// mirrors
+// (no userinfo) and the off/direct keywords.
+func offlineSafeProxyList(v string) bool {
+	for _, e := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == '|' }) {
+		e = strings.TrimSpace(e)
+		if e == "off" || e == "direct" {
+			continue
+		}
+		if !strings.HasPrefix(e, "file://") || strings.Contains(strings.TrimPrefix(e, "file://"), "@") {
+			return false
+		}
+	}
+	return v != ""
+}

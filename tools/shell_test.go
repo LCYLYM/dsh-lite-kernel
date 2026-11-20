@@ -179,6 +179,18 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 		if !strings.Contains(raw0.(map[string]any)["output"].(string), "GOPROXY=file://") {
 			t.Fatal("no-net sandbox dropped a local file:// GOPROXY")
 		}
+		// A remote credentialed entry behind a benign first entry
+		// must scrub the whole list.
+		t.Setenv("GOPROXY", "file:///root/m,https://user:pass@goproxy.corp")
+		s1 := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second}
+		args1, _ := json.Marshal(map[string]string{"cmd": "env"})
+		raw1, err := s1.Call(context.Background(), args1)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if strings.Contains(raw1.(map[string]any)["output"].(string), "GOPROXY=") {
+			t.Fatal("no-net sandbox kept a mixed GOPROXY list with credentials")
+		}
 		t.Setenv("GOPROXY", "https://user:pass@goproxy.corp")
 		t.Setenv("DSHK_TEST_TOKEN_X", "leak-me")
 		s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second, AllowNet: true}
