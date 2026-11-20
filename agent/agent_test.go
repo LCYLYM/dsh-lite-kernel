@@ -146,6 +146,55 @@ func TestMailboxDurableReplay(t *testing.T) {
 	}
 }
 
+// bigTool returns an oversized result.
+type bigTool struct{}
+
+func (bigTool) Name() string        { return "big" }
+func (bigTool) Description() string { return "returns a huge payload" }
+func (bigTool) Schema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{}}`)
+}
+func (bigTool) Call(ctx context.Context, args json.RawMessage) (any, error) {
+	return strings.Repeat("x", 200<<10), nil
+}
+
+// bigProvider asks for bigTool once, then finishes.
+type bigProvider struct{ calls int }
+
+func (p *bigProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	p.calls++
+	if p.calls == 1 {
+		return &llm.Response{Message: llm.Message{Role: "assistant",
+			ToolCalls: []llm.ToolCall{{ID: "t1", Name: "big"}}}, FinishReason: "tool_calls"}, nil
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}, nil
+}
+
+func TestToolResultCappedBeforeLog(t *testing.T) {
+	prov := &bigProvider{}
+	loop, lg := newLoop(t, prov)
+	loop.Registry.Register(bigTool{})
+	loop.Guard.MaxToolResultChars = 1024
+	state, err := loop.Run(context.Background(), "go")
+	if err != nil || state != Completed {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	var result map[string]any
+	lg.ReadFrom(0, func(ev session.Event) bool {
+		if ev.Type == "tool/result" {
+			json.Unmarshal(ev.Data, &result)
+		}
+		return true
+	})
+	inner, _ := result["content"].(map[string]any)
+	if inner["truncated"] != true {
+		t.Fatalf("result not marked truncated: %v", result)
+	}
+	if got := len(inner["content"].(string)); got != 1024 {
+		t.Fatalf("cap wrong: %d", got)
+	}
+}
+
 // gateProvider blocks until the gate closes or ctx dies.
 type gateProvider struct{ gate chan struct{} }
 
