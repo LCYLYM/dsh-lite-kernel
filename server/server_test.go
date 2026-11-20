@@ -301,6 +301,69 @@ func TestPostMessageBusyConflict(t *testing.T) {
 	}
 }
 
+// A delete must not close the log under an in-flight turn — the busy
+// session answers 409 like a busy postMessage; after the turn ends the
+// delete succeeds.
+func TestDeleteBusyConflict(t *testing.T) {
+	st, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	srv := &Server{
+		Store: st, Provider: &llm.EchoProvider{}, Model: "echo",
+		NewLoop: func(ses *session.Session) *agent.Loop {
+			root := kernel.NewRoot("root")
+			sc, _ := root.Child("a")
+			reg := agent.NewRegistry(sc, time.Second)
+			return &agent.Loop{
+				Model: "echo", Provider: &holdProvider{gate: gate}, Registry: reg, Log: ses.Log,
+				Budget: session.DefaultBudget(), Guard: agent.DefaultGuard(),
+				Retry: llm.Policy{Retries: 0},
+			}
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	res, err := http.Post(ts.URL+"/v1/sessions", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(res.Body).Decode(&created)
+	res.Body.Close()
+
+	post(t, ts.URL+"/v1/sessions/"+created.ID+"/messages", `{"text":"hi"}`)
+	time.Sleep(100 * time.Millisecond) // let the turn reach Complete
+
+	del := func() int {
+		req, _ := http.NewRequest("DELETE", ts.URL+"/v1/sessions/"+created.ID, nil)
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+	if code := del(); code != http.StatusConflict {
+		t.Fatalf("delete during turn: %d, want 409", code)
+	}
+	close(gate)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code := del()
+		if code == http.StatusNoContent {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delete after turn end: still %d after 5s", code)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 // Events appended during replay must not be delivered twice: the live
 // channel and the log replay both see them.
 func TestStreamNoDuplicateAfterReplay(t *testing.T) {
