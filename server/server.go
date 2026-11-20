@@ -131,18 +131,10 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	var after int64
 	if v := r.URL.Query().Get("after_seq"); v != "" {
-		var err error
-		if after, err = strconv.ParseInt(v, 10, 64); err != nil {
-			http.Error(w, "bad after_seq", http.StatusBadRequest)
-			return
-		}
+		after, _ = strconv.ParseInt(v, 10, 64)
 	}
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
-		var err error
-		if after, err = strconv.ParseInt(v, 10, 64); err != nil {
-			http.Error(w, "bad Last-Event-ID", http.StatusBadRequest)
-			return
-		}
+		after, _ = strconv.ParseInt(v, 10, 64)
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
