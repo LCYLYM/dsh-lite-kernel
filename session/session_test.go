@@ -111,6 +111,69 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	}
 }
 
+// A session reloaded from disk keeps its workspace binding — the meta
+// event rides in the log, not in process memory.
+func TestWorkspaceSurvivesReload(t *testing.T) {
+	dir := t.TempDir()
+	st1, _ := NewStore(filepath.Join(dir, "data"))
+	ses, err := st1.Create("/srv/ws-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1.Close() // the store lock is exclusive — release before reopening
+	st2, err := NewStore(filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	got, err := st2.Get(ses.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Workspace != "/srv/ws-a" {
+		t.Fatalf("workspace lost on reload: %q", got.Workspace)
+	}
+	if got.CreatedAt == 0 {
+		t.Fatal("created_at not persisted")
+	}
+}
+
+// After a restart the seq counter resumes past existing files: a new
+// session must never reuse an old id and append into the old log.
+func TestStoreIdsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	st1, _ := NewStore(filepath.Join(dir, "data"))
+	s1, err := st1.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.Log.Append("user/message", map[string]any{"role": "user", "content": "old session"})
+	st1.Close() // exclusive store lock — release before reopening
+
+	st2, err := NewStore(filepath.Join(dir, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	s2, err := st2.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.ID == s1.ID {
+		t.Fatalf("id reused across restart: %s", s2.ID)
+	}
+	var sawOldUser bool
+	_ = s2.Log.ReadFrom(0, func(ev Event) bool {
+		if ev.Type == "user/message" {
+			sawOldUser = true
+		}
+		return true
+	})
+	if sawOldUser {
+		t.Fatal("new session shares the old session's log")
+	}
+}
+
 // A tool/result whose call was evicted by the budget must not be sent to
 // the model: strict providers reject orphaned tool messages.
 func TestBuildContextDropsOrphanToolResults(t *testing.T) {

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -43,6 +44,22 @@ func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	st := &Store{dir: dir, live: map[string]*Session{}}
+	// Seed the id counter from what is already on disk: after a restart
+	// the in-memory seq restarts at 0, and without this a new session
+	// would reuse session-1-1 and append to the old session's log.
+	var maxSeq int64
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		var n int64
+		var tail int
+		for _, pat := range []string{"session-%d.jsonl", "session-%d-%d.jsonl"} {
+			if k, _ := fmt.Sscanf(e.Name(), pat, &n, &tail); k > 0 && n > maxSeq {
+				maxSeq = n
+			}
+		}
+	}
+	st.seq = maxSeq
 	lf, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -64,14 +81,25 @@ func (s *Store) Create(workspace string) (*Session, error) {
 func (s *Store) create(workspace string) (*Session, error) {
 	s.seq++
 	// Time-based component: two `dshk run`s on the same data dir must not
-	// mint the same id and silently share a log.
+	// mint the same id and silently share a log. The seq is seeded from
+	// disk at NewStore, so it stays unique for the life of the data dir.
 	id := fmt.Sprintf("session-%d-%d", time.Now().UnixNano(), s.seq)
 	path := filepath.Join(s.dir, id+".jsonl")
 	lg, err := OpenLog(path)
 	if err != nil {
 		return nil, err
 	}
-	ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: time.Now().Unix()}
+	// Workspace is durable: it rides in the log so a session reloaded
+	// from disk (after restart or eviction) keeps its binding. Not
+	// model-visible — BuildContext skips event types it does not know.
+	now := time.Now().Unix()
+	if _, err := lg.Append("session/meta", map[string]any{
+		"workspace": workspace, "created_at": now,
+	}); err != nil {
+		_ = lg.Close()
+		return nil, err
+	}
+	ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: now}
 	s.live[id] = ses
 	return ses, nil
 }
@@ -125,12 +153,30 @@ func (s *Store) Get(id string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	ses := &Session{ID: id, Log: lg}
-	// CreatedAt isn't persisted; the first event's timestamp is a cheap
-	// stand-in (one line read, no full replay).
-	var first Event
-	if err := lg.ReadFrom(0, func(ev Event) bool { first = ev; return false }); err == nil && !first.At.IsZero() {
-		ses.CreatedAt = first.At.Unix()
+	var ws string
+	var at int64
+	_ = lg.ReadFrom(0, func(ev Event) bool {
+		if ev.Type != "session/meta" {
+			return true
+		}
+		var m struct {
+			Workspace string `json:"workspace"`
+			CreatedAt int64  `json:"created_at"`
+		}
+		if json.Unmarshal(ev.Data, &m) == nil {
+			ws = m.Workspace
+			at = m.CreatedAt
+		}
+		return false
+	})
+	ses := &Session{ID: id, Workspace: ws, Log: lg, CreatedAt: at}
+	// Older logs predate session/meta; the first event's timestamp is a
+	// cheap stand-in (one line read, no full replay).
+	if ses.CreatedAt == 0 {
+		var first Event
+		if err := lg.ReadFrom(0, func(ev Event) bool { first = ev; return false }); err == nil && !first.At.IsZero() {
+			ses.CreatedAt = first.At.Unix()
+		}
 	}
 	s.live[id] = ses
 	return ses, nil
