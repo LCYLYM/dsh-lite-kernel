@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
 	"github.com/LCYLYM/dsh-lite-kernel/session"
@@ -35,11 +37,35 @@ type Loop struct {
 	Retry      llm.Policy
 	AutoResume bool // re-drive the turn after Waiting (goal runs, #13621)
 	ResumeMax  int
+	Stream     bool // prefer Streamer providers; deltas land in the log
+
+	turnMu sync.Mutex // one in-flight turn per log — see Run
+}
+
+// ErrTurnBusy is returned when a second Run starts while a turn is in
+// flight on the same log.
+var ErrTurnBusy = errors.New("agent: turn already in progress")
+
+// Busy reports whether a turn is in flight. It is a probe for callers
+// that want to reject early; Run still enforces the exclusion itself.
+func (l *Loop) Busy() bool {
+	if !l.turnMu.TryLock() {
+		return true
+	}
+	l.turnMu.Unlock()
+	return false
 }
 
 // Run executes one user turn: append the message, step the loop under the
-// guard, persist every model-visible event.
+// guard, persist every model-visible event. Two concurrent Runs on the
+// same log would interleave events (user B's message landing mid-turn A)
+// — the second caller gets ErrTurnBusy, a caller-visible rejection rather
+// than a silently corrupted history.
 func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
+	if !l.turnMu.TryLock() {
+		return Failed, ErrTurnBusy
+	}
+	defer l.turnMu.Unlock()
 	if _, err := l.Log.Append("user/message", map[string]any{
 		"role": "user", "content": userText,
 	}); err != nil {
@@ -76,18 +102,65 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
+		// Check spend before billing another call — an exhausted
+		// session aborts without contacting the provider (also covers
+		// reopened logs, where only durable usage survives).
+		if l.Guard.MaxSessionTokens > 0 {
+			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+				l.Log.Append("turn/end", map[string]any{
+					"reason": "aborted",
+					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
+				})
+				return Aborted, errors.New("agent: session token budget exceeded")
+			}
+		}
+		if err := Drain(l.Log); err != nil {
+			return Failed, err
+		}
 		msgs, err := session.BuildContext(l.Log, l.Budget)
 		if err != nil {
 			return Failed, err
 		}
+		// Pressure compaction: when the retained history window alone
+		// cannot fit the budget, fold history before it happens again
+		// (deterministic — no model call, no route to misconfigure).
+		if l.shouldCompact(msgs) {
+			l.compact()
+			if msgs, err = session.BuildContext(l.Log, l.Budget); err != nil {
+				return Failed, err
+			}
+		}
 		var resp *llm.Response
+		req := &llm.Request{
+			Model:    l.Model,
+			Messages: msgs,
+			Tools:    l.Registry.Specs(),
+		}
 		err = l.Retry.Do(ctx, func(c context.Context) error {
+			// A stalled provider call must not park the turn until the
+			// caller's outer deadline (#13621 frozen turns): bound each
+			// attempt, let Retry decide whether to take another.
+			if l.Guard.CallTimeout > 0 {
+				var cancel context.CancelFunc
+				c, cancel = context.WithTimeout(c, time.Duration(l.Guard.CallTimeout)*time.Second)
+				defer cancel()
+			}
 			var e error
-			resp, e = l.Provider.Complete(c, &llm.Request{
-				Model:    l.Model,
-				Messages: msgs,
-				Tools:    l.Registry.Specs(),
-			})
+			if l.Stream {
+				if st, ok := l.Provider.(llm.Streamer); ok {
+					resp, e = l.streamStep(c, st, req)
+				} else {
+					resp, e = l.Provider.Complete(c, req)
+				}
+			} else {
+				resp, e = l.Provider.Complete(c, req)
+			}
+			// A per-attempt deadline surfaced raw is a classified timeout
+			// — retryable, not an opaque turn failure.
+			if e != nil && c.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+				return &llm.CallError{Kind: llm.KindTimeout,
+					Message: fmt.Sprintf("provider call exceeded %ds", l.Guard.CallTimeout)}
+			}
 			if e != nil {
 				return e
 			}
@@ -120,11 +193,31 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 
 		text := contentText(resp.Message.Content)
 		truncated := resp.FinishReason == "length" || resp.FinishReason == "max_tokens"
-		l.Log.Append("assistant/message", map[string]any{
+		// Usage rides on the message event itself: one atomic append —
+		// a crash between the two can never lose usage a reply saved,
+		// and accounting costs zero extra events in the log.
+		ev := map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
 			"finish":     resp.FinishReason, "truncated": truncated,
-		})
+		}
+		if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+			ev["prompt_tokens"] = resp.Usage.InputTokens
+			ev["completion_tokens"] = resp.Usage.OutputTokens
+		}
+		l.Log.Append("assistant/message", ev)
+
+		// Crossing the cap aborts before tool side effects — this
+		// step's tool calls do not run. Same ordering as the guards.
+		if l.Guard.MaxSessionTokens > 0 {
+			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+				l.Log.Append("turn/end", map[string]any{
+					"reason": "aborted",
+					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
+				})
+				return Aborted, errors.New("agent: session token budget exceeded")
+			}
+		}
 
 		// Guard: repetition / no-progress / caps.
 		if abort, why := l.Guard.CheckStep(text, len(resp.Message.ToolCalls)); abort {
@@ -147,6 +240,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			if terr != nil {
 				out = map[string]any{"error": terr.Error()}
 			}
+			out = l.capResult(out)
 			l.Log.Append("tool/result", map[string]any{
 				"tool_call_id": tc.ID, "name": tc.Name, "content": out, "error": terr != nil,
 			})
@@ -189,6 +283,71 @@ func hasVisibleText(c any) bool {
 		return false
 	}
 	return false
+}
+
+// capResult truncates an oversized tool result before it lands in the
+// log — a single runaway tool must not dump unbounded bytes into the
+// durable stream (and from there into every later context). The marker
+// keeps the truncation model-visible.
+func (l *Loop) capResult(out any) any {
+	max := l.Guard.MaxToolResultChars
+	if max <= 0 {
+		return out
+	}
+	b, err := json.Marshal(out)
+	if err != nil || utf8.RuneCount(b) <= max {
+		return out
+	}
+	runes := []rune(string(b))
+	return map[string]any{
+		"truncated":   true,
+		"total_chars": utf8.RuneCount(b),
+		"content":     string(runes[:max]),
+	}
+}
+
+// shouldCompact fires when unfolded history exceeds the context scan
+// window — the sign that the next request would silently drop old
+// events rather than fold them.
+func (l *Loop) shouldCompact(msgs []llm.Message) bool {
+	window := int64(l.Budget.MaxEvents * 4)
+	return l.Log.Len()-l.Log.CompactedThrough() > window
+}
+
+func (l *Loop) compact() {
+	through := l.Log.Len() - int64(l.Budget.MaxEvents)
+	if err := session.Compact(l.Log, through); err != nil {
+		l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()})
+	}
+}
+
+// streamStep runs one model call through Streamer, logging throttled
+// assistant/delta events so the live feed shows progress without an
+// event per token (bounded log: deltas coalesce to ~4 KiB).
+func (l *Loop) streamStep(ctx context.Context, st llm.Streamer, req *llm.Request) (*llm.Response, error) {
+	var pending strings.Builder
+	flush := func() {
+		if pending.Len() == 0 {
+			return
+		}
+		l.Log.Append("assistant/delta", map[string]any{"text": pending.String()})
+		pending.Reset()
+	}
+	resp, err := st.Stream(ctx, req, func(d llm.Delta) error {
+		if d.Text != "" {
+			pending.WriteString(d.Text)
+			if pending.Len() >= 4096 {
+				flush()
+			}
+		}
+		if d.ToolName != "" {
+			flush()
+			l.Log.Append("assistant/tool-intent", map[string]any{"name": d.ToolName, "index": d.CallIndex})
+		}
+		return ctx.Err()
+	})
+	flush()
+	return resp, err
 }
 
 func contentText(c any) string {
