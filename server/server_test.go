@@ -415,3 +415,35 @@ func TestNoticeWakeFalseDoesNotWake(t *testing.T) {
 		t.Fatal("wake=false notice never delivered on the next turn")
 	}
 }
+
+func TestUsageEndpoint(t *testing.T) {
+	ts, st := newTestServer(t)
+	defer ts.Close()
+	ses, err := st.Create(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(ts.URL + "/v1/sessions/" + ses.ID + "/usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	var u map[string]int
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := u["input_tokens"]; !ok {
+		t.Fatalf("missing input_tokens in %v", u)
+	}
+	resp2, err := http.Get(ts.URL + "/v1/sessions/nope/usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 404 {
+		t.Fatalf("missing session: status %d", resp2.StatusCode)
+	}
+}

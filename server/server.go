@@ -63,6 +63,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}/history", s.history)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
 	mux.HandleFunc("GET /v1/sessions/{id}/tail", s.tailSession)
+	mux.HandleFunc("GET /v1/sessions/{id}/usage", s.getUsage)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", s.deleteSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/fork", s.forkSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/cancel", s.cancelTurn)
@@ -110,6 +111,17 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		"created_at": ses.CreatedAt,
 		"events":     ses.Log.Len(),
 	})
+}
+
+// getUsage returns the aggregated token accounting Usage() folds out
+// of turn/usage events — the durable total a host bills or budgets on.
+func (s *Server) getUsage(w http.ResponseWriter, r *http.Request) {
+	ses, err := s.Store.Get(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, session.Usage(ses.Log))
 }
 
 // history pages events without SSE: ?after=<seq>&limit=<n> (default
