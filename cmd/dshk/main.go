@@ -285,7 +285,7 @@ func cmdRun(args []string) {
 		// this command happens to run. It is recorded by whatever
 		// client created the session, so adopting it is visible and
 		// fail-loud rather than silent.
-		if !wsSet {
+		if !wsSet && ses.Workspace != "" {
 			if st, err := os.Stat(ses.Workspace); err != nil || !st.IsDir() {
 				log.Fatalf("session %s records workspace %q which is not a directory here — pass -workspace explicitly", ses.ID, ses.Workspace)
 			}
@@ -294,6 +294,8 @@ func cmdRun(args []string) {
 			}
 			*ws = ses.Workspace
 		}
+		// A session with no recorded workspace keeps the flag
+		// default — "" is "not recorded", not "the empty dir".
 	} else if ses, err = store.Create(*ws); err != nil {
 		log.Fatal(err)
 	}
