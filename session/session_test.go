@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestLogAppendReadRoundTrip(t *testing.T) {
@@ -112,6 +113,7 @@ func TestRetryMarkerSkipped(t *testing.T) {
 
 // A slow replay must not stall appends — ReadFrom reads through a
 // private descriptor, so writers never queue behind a client scan.
+// Holding l.mu across the replay would deadlock this test.
 func TestReplayDoesNotBlockAppends(t *testing.T) {
 	dir := t.TempDir()
 	lg, err := OpenLog(filepath.Join(dir, "s.jsonl"))
@@ -121,27 +123,30 @@ func TestReplayDoesNotBlockAppends(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		lg.Append("user/message", map[string]any{"role": "user", "content": i})
 	}
-	stop := make(chan struct{})
-	done := make(chan struct{})
+	started := make(chan struct{})
+	appended := make(chan struct{})
 	go func() {
-		defer close(done)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
+		<-started
+		for i := 0; i < 500; i++ {
 			lg.Append("user/message", map[string]any{"role": "user", "content": "x"})
 		}
+		close(appended)
 	}()
-	var n int
-	err = lg.ReadFrom(0, func(ev Event) bool { n++; return true })
-	close(stop)
-	<-done
+	first := true
+	err = lg.ReadFrom(0, func(ev Event) bool {
+		if first {
+			first = false
+			close(started)
+			select {
+			case <-appended:
+			case <-time.After(10 * time.Second):
+				t.Error("appends stalled behind the replay")
+				return false
+			}
+		}
+		return true
+	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if n < 2000 {
-		t.Fatalf("replay saw %d events", n)
 	}
 }
