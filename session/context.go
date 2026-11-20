@@ -92,8 +92,25 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		count++
 		rev = append(rev, m)
 	}
-	for i := len(rev) - 1; i >= 0; i-- {
-		msgs = append(msgs, rev[i])
+	// A backward scan can cut between an assistant tool_call and its
+	// tool/result (the result is newer, so it survives while the call is
+	// evicted). An orphaned tool message hard-fails strict providers, so
+	// drop results whose call is not in the window.
+	ids := map[string]bool{}
+	for _, m := range rev {
+		for _, tc := range m.ToolCalls {
+			ids[tc.ID] = true
+		}
+	}
+	kept := rev[:0]
+	for _, m := range rev {
+		if m.Role == "tool" && !ids[m.ToolCallID] {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	for i := len(kept) - 1; i >= 0; i-- {
+		msgs = append(msgs, kept[i])
 	}
 	if b.SystemText != "" {
 		msgs = append([]llm.Message{{Role: "system", Content: b.SystemText}}, msgs...)
