@@ -74,6 +74,15 @@ func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws st
 		reg.Register(tools.Echo{})
 		reg.Register(tools.ReadFile{W: w})
 		reg.Register(tools.WriteFile{W: w})
+		reg.Register(tools.EditFile{W: w})
+		reg.Register(tools.ListFiles{W: w})
+		reg.Register(tools.GrepFile{W: w})
+		reg.Register(tools.Fetch{})
+		// Shell runs under namespace confinement; on hosts without user
+		// namespaces it reports "unavailable" per call unless the operator
+		// explicitly opts into unsandboxed execution.
+		reg.Register(tools.Shell{W: w, AllowUnsandboxed: os.Getenv("DSHK_ALLOW_UNSANDBOXED") != ""})
+		reg.Register(agent.PlanTool{Log: ses.Log})
 		b := session.DefaultBudget()
 		b.SystemText = "You are dsh-lite, a minimal agent. Use tools when needed."
 		return &agent.Loop{
