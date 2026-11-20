@@ -150,6 +150,7 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	ch, unsub := ses.Log.Subscribe(256)
 	defer unsub()
 
+	var lastSeq int64
 	send := func(ev session.Event) bool {
 		data, _ := json.Marshal(ev)
 		// A write deadline: a peer that stops reading is closed instead of
@@ -158,20 +159,33 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, data); err != nil {
 			return false
 		}
+		lastSeq = ev.Seq
 		fl.Flush()
 		return true
 	}
 
 	// 1. Replay from the durable log — this is what makes the stream
-	//    resumable instead of permanently dead (#13747).
-	replayErr := ses.Log.ReadFrom(after, func(ev session.Event) bool {
-		return send(ev)
-	})
-	if replayErr != nil {
-		return
+	//    resumable instead of permanently dead (#13747). The replay is
+	//    snapshot-bounded, so catch up again for events appended (and
+	//    possibly dropped from the channel buffer) mid-replay; repeat
+	//    until a pass makes no progress.
+	sentOK := true
+	for sentOK {
+		replayErr := ses.Log.ReadFrom(after, func(ev session.Event) bool {
+			sentOK = send(ev)
+			return sentOK
+		})
+		if replayErr != nil || !sentOK {
+			return
+		}
+		if lastSeq <= after {
+			break // nothing sent — the log has not moved past the cursor
+		}
+		after = lastSeq
 	}
 
-	// 2. Live tail + heartbeat.
+	// 2. Live tail + heartbeat. Events the catch-up already sent may
+	//    still sit in the channel — skip anything at or below lastSeq.
 	heartbeat := time.NewTicker(20 * time.Second)
 	defer heartbeat.Stop()
 	for {
@@ -179,7 +193,13 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case ev, ok := <-ch:
-			if !ok || !send(ev) {
+			if !ok {
+				return
+			}
+			if ev.Seq <= lastSeq {
+				continue
+			}
+			if !send(ev) {
 				return
 			}
 		case <-heartbeat.C:
