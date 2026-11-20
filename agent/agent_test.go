@@ -1,7 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -174,5 +178,140 @@ func TestSessionTokenBudgetAborts(t *testing.T) {
 	}
 	if prov.calls != 1 {
 		t.Fatalf("provider called %d times after budget exhausted", prov.calls)
+	}
+}
+
+// capProvider records the message list it is asked to complete.
+type capProvider struct{ msgs []llm.Message }
+
+func (p *capProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	p.msgs = append([]llm.Message(nil), r.Messages...)
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestMailboxNoticesReachNextRequest(t *testing.T) {
+	prov := &capProvider{}
+	loop, lg := newLoop(t, prov)
+	if err := Post(lg, Notice{ID: "n1", From: "child-1", Kind: "done",
+		Payload: json.RawMessage(`{"result":42}`)}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loop.Run(context.Background(), "hello")
+	if err != nil || state != Completed {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	found := false
+	for _, m := range prov.msgs {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice from child-1") && strings.Contains(s, `"result":42`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("notice never reached the model request")
+	}
+	if p, _ := Pending(lg); len(p) != 0 {
+		t.Fatal("notice left pending")
+	}
+	// replay on resume injects nothing new — delivered is durable
+	msgs2, _ := session.BuildContext(lg, loop.Budget)
+	seen := 0
+	for _, m := range msgs2 {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice") {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("expected exactly one injected notice, got %d", seen)
+	}
+}
+
+func TestDrainCrashBeforeAckReinjectsInvisible(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lg, _ := session.OpenLog(path)
+	Post(lg, Notice{ID: "n1", From: "c", Kind: "done", Payload: json.RawMessage(`1`)})
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after inject but before ack: strip the delivered
+	// events by rewriting the log without them, then reopen.
+	f, _ := os.ReadFile(path)
+	kept := []byte{}
+	for _, line := range bytes.Split(f, []byte("\n")) {
+		if len(line) > 0 && !bytes.Contains(line, []byte("delivered")) {
+			kept = append(append(kept, line...), '\n')
+		}
+	}
+	os.WriteFile(path, kept, 0o600)
+	lg2, _ := session.OpenLog(path)
+	if err := Drain(lg2); err != nil {
+		t.Fatal(err)
+	}
+	// notice is injected again, but BuildContext dedups by id
+	msgs, _ := session.BuildContext(lg2, session.DefaultBudget())
+	seen := 0
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice from c") {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("notice rendered %d times after reinject", seen)
+	}
+}
+
+func TestDrainBatchCapLeavesRestPending(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	for i := 0; i < maxDrainBatch+3; i++ {
+		Post(lg, Notice{ID: fmt.Sprintf("n%d", i), From: "c", Kind: "k", Payload: json.RawMessage(`1`)})
+	}
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	mb := mailboxFor(lg)
+	if len(mb.pending) != 3 {
+		t.Fatalf("expected 3 pending after capped drain, got %d", len(mb.pending))
+	}
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	if len(mb.pending) != 0 {
+		t.Fatal("remaining notices not drained")
+	}
+}
+
+func TestMailboxIndexReleasedOnClose(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mailboxes.Load(lg); !ok {
+		t.Fatal("index missing after drain")
+	}
+	lg.Close()
+	if _, ok := mailboxes.Load(lg); ok {
+		t.Fatal("index rooted a closed log")
+	}
+}
+
+func TestIDlessNoticesAllRendered(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	// Two injections carrying ID-less notices — both must render.
+	lg.Append("mailbox/inject", map[string]any{"notices": []map[string]any{
+		{"from": "a", "kind": "k", "payload": json.RawMessage(`1`)},
+		{"from": "b", "kind": "k", "payload": json.RawMessage(`2`)},
+	}})
+	msgs, _ := session.BuildContext(lg, session.DefaultBudget())
+	found := 0
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok {
+			found += strings.Count(s, "[mailbox notice")
+		}
+	}
+	if found != 2 {
+		t.Fatalf("id-less notices collapsed: %d rendered", found)
 	}
 }
