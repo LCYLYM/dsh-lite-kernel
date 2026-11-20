@@ -50,7 +50,10 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Workspace string `json:"workspace"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := decodeJSON(w, r, &body); err != nil {
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
 	ses, reused, err := s.Store.CreateOrReuseBlank(body.Workspace)
 	if err != nil {
 		writeErr(w, err)
@@ -83,7 +86,7 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Text string `json:"text"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Text == "" {
+	if err := decodeJSON(w, r, &body); err != nil || body.Text == "" {
 		http.Error(w, "text required", http.StatusBadRequest)
 		return
 	}
@@ -106,7 +109,7 @@ func (s *Server) postNotice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var n agent.Notice
-	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
+	if err := decodeJSON(w, r, &n); err != nil {
 		http.Error(w, "bad notice", http.StatusBadRequest)
 		return
 	}
@@ -213,4 +216,12 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func writeErr(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// decodeJSON reads a request body with a hard cap so a fat body cannot
+// grow the heap without bound; decoding failures surface as 400 instead
+// of silently defaulting the request.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	return json.NewDecoder(r.Body).Decode(v)
 }

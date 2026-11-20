@@ -119,3 +119,27 @@ func TestStreamResumeFromSeq(t *testing.T) {
 		t.Fatal("no live event after resume")
 	}
 }
+
+func TestRejectsMalformedAndOversizedBodies(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/sessions", "application/json", strings.NewReader("{not json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed body: status %d", resp.StatusCode)
+	}
+
+	big := strings.NewReader(`{"workspace":"` + strings.Repeat("x", 2<<20) + `"}`)
+	resp, err = http.Post(ts.URL+"/v1/sessions", "application/json", big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized body: status %d", resp.StatusCode)
+	}
+}
