@@ -81,7 +81,11 @@ func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws st
 		// Shell runs under namespace confinement; on hosts without user
 		// namespaces it reports "unavailable" per call unless the operator
 		// explicitly opts into unsandboxed execution.
-		reg.Register(tools.Shell{W: w, AllowUnsandboxed: os.Getenv("DSHK_ALLOW_UNSANDBOXED") != ""})
+		reg.Register(tools.Shell{
+			W:                w,
+			AllowUnsandboxed: os.Getenv("DSHK_ALLOW_UNSANDBOXED") != "",
+			AllowNet:         os.Getenv("DSHK_SHELL_NET") != "",
+		})
 		reg.Register(agent.PlanTool{Log: ses.Log})
 		b := session.DefaultBudget()
 		b.SystemText = "You are dsh-lite, a minimal agent. Use tools when needed."

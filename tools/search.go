@@ -45,6 +45,11 @@ func (t ListFiles) Call(_ context.Context, args json.RawMessage) (any, error) {
 		max = 500
 	}
 	wsRoot, _ := filepath.Abs(t.W.Root)
+	// root is a resolved path; relativizing it against the lexical root
+	// produces unusable ".." results when the workspace is symlinked.
+	if real, err := filepath.EvalSymlinks(wsRoot); err == nil {
+		wsRoot = real
+	}
 	var out []string
 	truncated := false
 	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
@@ -118,6 +123,9 @@ func (t GrepFile) Call(ctx context.Context, args json.RawMessage) (any, error) {
 		max = 100
 	}
 	wsRoot, _ := filepath.Abs(t.W.Root)
+	if real, err := filepath.EvalSymlinks(wsRoot); err == nil {
+		wsRoot = real
+	}
 	hits := []grepHit{}
 	truncated := false
 	if info, _ := os.Stat(root); info != nil && !info.IsDir() {

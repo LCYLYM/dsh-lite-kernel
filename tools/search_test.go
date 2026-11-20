@@ -110,3 +110,33 @@ func TestGrepSkipsSpecialFiles(t *testing.T) {
 		t.Fatal("explicit oversized file searched")
 	}
 }
+
+// A symlinked workspace root used to produce ".." results: walked
+// paths are resolved while the relativize root was lexical.
+func TestListFilesSymlinkedWorkspace(t *testing.T) {
+	real := t.TempDir()
+	os.WriteFile(filepath.Join(real, "a.txt"), []byte("x"), 0o600)
+	link := filepath.Join(t.TempDir(), "ws")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	res, err := ListFiles{W: Workspace{Root: link}}.Call(context.Background(),
+		json.RawMessage(`{"path":"."}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := res.(map[string]any)
+	entries, _ := m["files"].([]string)
+	found := false
+	for _, e := range entries {
+		if strings.HasPrefix(e, "..") {
+			t.Fatalf("unusable escaped path in listing: %q", e)
+		}
+		if e == "a.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("entries %v", entries)
+	}
+}
