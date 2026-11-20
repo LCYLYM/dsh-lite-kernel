@@ -205,10 +205,28 @@ func (s *Server) tailSession(w http.ResponseWriter, r *http.Request) {
 // fail every later turn.
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Deleting under an in-flight turn closed the log mid-turn: the
+	// turn failed on its next append and its turn/end never landed.
+	// Suspend the loop first — a busy session gets a 409 like a busy
+	// postMessage, not a corrupted turn.
+	s.mu.Lock()
+	l := s.loops[id]
+	s.mu.Unlock()
+	var unsuspend func()
+	if l != nil {
+		var ok bool
+		if unsuspend, ok = l.Suspend(); !ok {
+			http.Error(w, "turn in progress", http.StatusConflict)
+			return
+		}
+	}
 	err := s.Store.Delete(id)
 	s.mu.Lock()
 	delete(s.loops, id)
 	s.mu.Unlock()
+	if unsuspend != nil {
+		unsuspend()
+	}
 	if err != nil {
 		writeErr(w, err)
 		return

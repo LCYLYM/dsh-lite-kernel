@@ -49,6 +49,17 @@ type Loop struct {
 // flight on the same log.
 var ErrTurnBusy = errors.New("agent: turn already in progress")
 
+// Suspend claims the turn slot: while the returned release func is
+// held, no Run can start — for callers that must act on the session
+// without a turn racing in (session delete). A false result means a
+// turn is in flight right now.
+func (l *Loop) Suspend() (release func(), ok bool) {
+	if !l.turnMu.TryLock() {
+		return nil, false
+	}
+	return l.turnMu.Unlock, true
+}
+
 // Busy reports whether a turn is in flight. It is a probe for callers
 // that want to reject early; Run still enforces the exclusion itself.
 func (l *Loop) Busy() bool {
