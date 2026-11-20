@@ -122,6 +122,58 @@ func TestStreamResumeFromSeq(t *testing.T) {
 	}
 }
 
+func TestStreamGapFillAfterBufferOverflow(t *testing.T) {
+	st, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Store: st, EventBuf: 1, Heartbeat: 50 * time.Millisecond,
+		Provider: &llm.EchoProvider{}, Model: "echo",
+		NewLoop: func(ses *session.Session) *agent.Loop { return nil }}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	ses, err := st.Create("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET",
+		ts.URL+"/v1/sessions/"+ses.ID+"/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// let the handler subscribe before the burst
+	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < 300; i++ {
+		ses.Log.Append("assistant/message", map[string]any{"content": i})
+	}
+	// read until seq 300 arrives — buffer drops must be refilled
+	sc := bufio.NewScanner(resp.Body)
+	last := int64(0)
+	deadline := time.Now().Add(10 * time.Second)
+	for last < 300 && time.Now().Before(deadline) {
+		if !sc.Scan() {
+			t.Fatalf("stream ended early: %v", sc.Err())
+		}
+		line := sc.Text()
+		if strings.HasPrefix(line, "id: ") {
+			var n int64
+			fmt.Sscanf(line, "id: %d", &n)
+			if n != last+1 {
+				t.Fatalf("gap in delivered seqs: got %d after %d", n, last)
+			}
+			last = n
+		}
+	}
+	if last != 300 {
+		t.Fatalf("only %d/300 events delivered", last)
+	}
+}
+
 type holdProvider struct{ gate chan struct{} }
 
 func (p *holdProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
