@@ -1,9 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"strings"
 	"time"
 
@@ -22,7 +26,22 @@ type MCPTool struct {
 	CallTimeout time.Duration
 }
 
-func (t MCPTool) Name() string { return "mcp_" + sanitize(t.ServerName) + "_" + sanitize(t.RemoteName) }
+// maxToolNameLen mirrors the strictest provider constraint (OpenAI's
+// 64-char function-name limit): a longer name would reject the whole
+// request, even when the tool is never called.
+const maxToolNameLen = 64
+
+func (t MCPTool) Name() string {
+	n := "mcp_" + sanitize(t.ServerName) + "_" + sanitize(t.RemoteName)
+	if len(n) <= maxToolNameLen {
+		return n
+	}
+	// Keep a readable prefix; the hash suffix keeps truncated names
+	// unique and deterministic so the model calls back the same name.
+	h := fnv.New32a()
+	io.WriteString(h, n)
+	return n[:maxToolNameLen-9] + "_" + hex.EncodeToString(h.Sum(nil))[:8]
+}
 
 func (t MCPTool) Description() string { return t.Desc }
 
@@ -36,7 +55,12 @@ func (t MCPTool) Schema() json.RawMessage {
 func (t MCPTool) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	var a map[string]any
 	if len(args) > 0 {
-		if err := json.Unmarshal(args, &a); err != nil {
+		// UseNumber: plain Unmarshal coerces to float64, silently
+		// rounding integers past 2^53 (ids, offsets) before the server
+		// ever sees them.
+		dec := json.NewDecoder(bytes.NewReader(args))
+		dec.UseNumber()
+		if err := dec.Decode(&a); err != nil {
 			return nil, fmt.Errorf("agent: mcp tool %s got undecodable args: %w", t.Name(), err)
 		}
 	}

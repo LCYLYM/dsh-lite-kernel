@@ -235,6 +235,18 @@ func connectMCPs(specs mcpFlags) ([]agent.MCPTool, func(), error) {
 		tools = append(tools, ts...)
 		clients = append(clients, c)
 	}
+	// Names sanitize (and long ones hash-truncate), so two distinct
+	// remote tools can land on the same registered name — fail loud at
+	// startup rather than silently dropping every later one.
+	seen := map[string]string{}
+	for _, t := range tools {
+		if prev, dup := seen[t.Name()]; dup {
+			close()
+			return nil, nil, fmt.Errorf("mcp tools %q (server %s) and %q (server %s) both register as %q",
+				prev, prev, t.RemoteName, t.ServerName, t.Name())
+		}
+		seen[t.Name()] = fmt.Sprintf("%s.%s", t.ServerName, t.RemoteName)
+	}
 	return tools, close, nil
 }
 
@@ -261,7 +273,9 @@ func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws st
 		})
 		reg.Register(agent.PlanTool{Log: ses.Log})
 		for _, t := range mcpTools {
-			reg.Register(t)
+			if _, err := reg.Register(t); err != nil {
+				log.Printf("mcp tool %s: %v", t.Name(), err)
+			}
 		}
 		b := session.DefaultBudget()
 		b.SystemText = "You are dsh-lite, a minimal agent. Use tools when needed."
