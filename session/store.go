@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Session is a durable conversation: a log plus metadata.
@@ -49,7 +50,7 @@ func (s *Store) create(workspace string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	ses := &Session{ID: id, Workspace: workspace, Log: lg}
+	ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: time.Now().Unix()}
 	s.live[id] = ses
 	return ses, nil
 }
