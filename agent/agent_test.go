@@ -146,6 +146,94 @@ func TestMailboxDurableReplay(t *testing.T) {
 	}
 }
 
+// A "stop" response with no text and no tool calls is not a completed
+// step (upstream #13822): retry through the policy, and if it stays
+// empty the turn goes Waiting — never a silent "completed".
+type emptyProvider struct{ left int }
+
+func (e *emptyProvider) Complete(_ context.Context, req *llm.Request) (*llm.Response, error) {
+	if e.left > 0 {
+		e.left--
+		return &llm.Response{Message: llm.Message{Role: "assistant"}, FinishReason: "stop"}, nil
+	}
+	if last := req.Messages[len(req.Messages)-1]; last.Role == "tool" {
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}, nil
+	}
+	args, _ := json.Marshal(map[string]string{"text": "x"})
+	return &llm.Response{
+		Message:      llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "echo", Args: args}}},
+		FinishReason: "tool_calls",
+	}, nil
+}
+
+func TestEmptyResponseIsRetried(t *testing.T) {
+	loop, lg := newLoop(t, &emptyProvider{left: 2})
+	loop.Retry = llm.Policy{Retries: 4, Base: time.Millisecond}
+	state, err := loop.Run(context.Background(), "hi")
+	if state != Completed || err != nil {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	// No empty assistant message (no content and no tool calls) may reach the log.
+	var empty bool
+	_ = lg.ReadFrom(0, func(ev session.Event) bool {
+		if ev.Type != "assistant/message" {
+			return true
+		}
+		var m struct {
+			Content   any             `json:"content"`
+			ToolCalls json.RawMessage `json:"tool_calls"`
+		}
+		if json.Unmarshal(ev.Data, &m) == nil && m.Content == nil && len(m.ToolCalls) == 0 {
+			empty = true
+		}
+		return true
+	})
+	if empty {
+		t.Fatal("empty assistant message was logged")
+	}
+}
+
+func TestPersistentEmptyResponseGoesWaiting(t *testing.T) {
+	loop, _ := newLoop(t, &emptyProvider{left: 100})
+	loop.Retry = llm.Policy{Retries: 2, Base: time.Millisecond}
+	state, err := loop.Run(context.Background(), "hi")
+	if state != Waiting || err == nil {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+}
+
+// Reasoning-only content blocks (upstream #13822's actual shape) count
+// as an empty response too — JSON-serializing the blocks must not pass
+// the blank check.
+type reasoningProvider struct{ called int }
+
+func (r *reasoningProvider) Complete(_ context.Context, req *llm.Request) (*llm.Response, error) {
+	r.called++
+	if last := req.Messages[len(req.Messages)-1]; last.Role == "tool" {
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}, nil
+	}
+	if r.called == 1 {
+		return &llm.Response{
+			Message:      llm.Message{Role: "assistant", Content: []any{map[string]any{"type": "reasoning", "reasoning": "draft"}}},
+			FinishReason: "stop",
+		}, nil
+	}
+	args, _ := json.Marshal(map[string]string{"text": "x"})
+	return &llm.Response{
+		Message:      llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "echo", Args: args}}},
+		FinishReason: "tool_calls",
+	}, nil
+}
+
+func TestReasoningOnlyResponseIsRetried(t *testing.T) {
+	loop, _ := newLoop(t, &reasoningProvider{})
+	loop.Retry = llm.Policy{Retries: 2, Base: time.Millisecond}
+	state, err := loop.Run(context.Background(), "hi")
+	if state != Completed || err != nil {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+}
+
 // A same-named tool in a child scope shadows the parent's: Call resolves
 // the shadowing one, and Specs advertises it only once.
 func TestRegistryChildShadowsParentTool(t *testing.T) {
