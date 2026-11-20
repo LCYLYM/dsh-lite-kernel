@@ -33,7 +33,21 @@ func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir, live: map[string]*Session{}}, nil
+	st := &Store{dir: dir, live: map[string]*Session{}}
+	// Seed the id counter from what is already on disk: after a restart
+	// the in-memory seq restarts at 0, and without this a new session
+	// would reuse session-1-1 and append to the old session's log.
+	var maxSeq int64
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		var n int64
+		var tail int
+		if k, _ := fmt.Sscanf(e.Name(), "session-%d-%d.jsonl", &n, &tail); k > 0 && n > maxSeq {
+			maxSeq = n
+		}
+	}
+	st.seq = maxSeq
+	return st, nil
 }
 
 // Create opens a fresh session.
@@ -58,6 +72,7 @@ func (s *Store) create(workspace string) (*Session, error) {
 	if _, err := lg.Append("session/meta", map[string]any{
 		"workspace": workspace, "created_at": now,
 	}); err != nil {
+		_ = lg.Close()
 		return nil, err
 	}
 	ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: now}

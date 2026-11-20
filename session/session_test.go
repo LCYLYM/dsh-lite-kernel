@@ -131,3 +131,34 @@ func TestWorkspaceSurvivesReload(t *testing.T) {
 		t.Fatal("created_at not persisted")
 	}
 }
+
+// After a restart the seq counter resumes past existing files: a new
+// session must never reuse an old id and append into the old log.
+func TestStoreIdsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	st1, _ := NewStore(filepath.Join(dir, "data"))
+	s1, err := st1.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.Log.Append("user/message", map[string]any{"role": "user", "content": "old session"})
+
+	st2, _ := NewStore(filepath.Join(dir, "data"))
+	s2, err := st2.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.ID == s1.ID {
+		t.Fatalf("id reused across restart: %s", s2.ID)
+	}
+	var sawOldUser bool
+	_ = s2.Log.ReadFrom(0, func(ev Event) bool {
+		if ev.Type == "user/message" {
+			sawOldUser = true
+		}
+		return true
+	})
+	if sawOldUser {
+		t.Fatal("new session shares the old session's log")
+	}
+}
