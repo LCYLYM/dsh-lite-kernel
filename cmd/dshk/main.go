@@ -255,7 +255,15 @@ func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws st
 		root := kernel.NewRoot("root")
 		sc, _ := root.Child("agent/" + ses.ID)
 		reg := agent.NewRegistry(sc, 60*time.Second)
-		w := tools.Workspace{Root: ws}
+		// The session's recorded workspace wins over the serve-time
+		// default — same adoption rule as `run -session`: tools act
+		// where the session was created. Sessions recorded with ""
+		// (daemon-rooted) keep the serve-time root.
+		toolRoot := ws
+		if ses.Workspace != "" {
+			toolRoot = ses.Workspace
+		}
+		w := tools.Workspace{Root: toolRoot}
 		reg.Register(tools.Echo{})
 		reg.Register(tools.ReadFile{W: w})
 		reg.Register(tools.WriteFile{W: w})

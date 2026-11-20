@@ -140,6 +140,13 @@ func (s *Store) Fork(id string) (*Session, error) {
 // name that exists on disk — after a restart seq is reseeded, and a
 // reused name would reopen (or truncate) another session's log.
 func (s *Store) create(workspace string) (*Session, error) {
+	// Record the absolute path: "." means the creating process's cwd,
+	// which a later daemon serving the same store cannot reconstruct.
+	if workspace != "" {
+		if abs, err := filepath.Abs(workspace); err == nil {
+			workspace = abs
+		}
+	}
 	for {
 		s.seq++
 		id := fmt.Sprintf("session-%d-%d", time.Now().UnixNano(), s.seq)

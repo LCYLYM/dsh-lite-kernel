@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +87,17 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &body); err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
+	}
+	// The recorded workspace is honored per session by the loop
+	// factory — a path that cannot serve as a tool root is a loud
+	// 400 at creation, not a session whose tools fail mysteriously
+	// later.
+	if body.Workspace != "" {
+		st, err := os.Stat(body.Workspace)
+		if err != nil || !st.IsDir() {
+			http.Error(w, "workspace is not an existing directory", http.StatusBadRequest)
+			return
+		}
 	}
 	ses, reused, err := s.Store.CreateOrReuseBlank(body.Workspace)
 	if err != nil {
