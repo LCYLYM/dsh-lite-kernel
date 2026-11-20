@@ -7,6 +7,7 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ type Log struct {
 	offsets []int64 // byte offset of each event line, index = seq-1... seq starts at 1
 	nextSeq int64
 	subs    map[chan Event]struct{}
+	compact *Compaction // newest session/compaction marker, if any
 	onClose []func()
 }
 
@@ -49,6 +51,15 @@ func OpenLog(path string) (*Log, error) {
 	var off int64
 	for sc.Scan() {
 		l.offsets = append(l.offsets, off)
+		if bytes.Contains(sc.Bytes(), []byte("session/compaction")) {
+			var ev Event
+			if json.Unmarshal(sc.Bytes(), &ev) == nil && ev.Type == "session/compaction" {
+				var c Compaction
+				if json.Unmarshal(ev.Data, &c) == nil {
+					l.compact = &c
+				}
+			}
+		}
 		off += int64(len(sc.Bytes())) + 1
 		l.nextSeq++
 	}
@@ -65,6 +76,18 @@ func OpenLog(path string) (*Log, error) {
 
 // Len returns the number of events.
 func (l *Log) Len() int64 { return l.nextSeq - 1 }
+
+// CompactedThrough is the seq the newest compaction marker covers (0
+// when none exists), kept in memory — O(1), no scan.
+func (l *Log) CompactedThrough() int64 {
+	if l.compact == nil {
+		return 0
+	}
+	return l.compact.ThroughSeq
+}
+
+// NewestCompaction returns the newest compaction marker, or nil.
+func (l *Log) NewestCompaction() *Compaction { return l.compact }
 
 // Append writes an event, fsyncs, and notifies subscribers. Delivery
 // order is seq order; subscribers that lag drop nothing — they replay
@@ -93,6 +116,12 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 	}
 	l.offsets = append(l.offsets, off)
 	l.nextSeq++
+	if typ == "session/compaction" {
+		var c Compaction
+		if json.Unmarshal(raw, &c) == nil {
+			l.compact = &c
+		}
+	}
 	for ch := range l.subs {
 		select {
 		case ch <- ev:
