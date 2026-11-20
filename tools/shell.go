@@ -199,19 +199,25 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 }
 
 // envScrubbed returns the process environment minus credential-shaped
-// variables — names carrying KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL
-// or AUTH — so a shell command cannot exfiltrate daemon credentials
-// through its logged output.
+// variables — names carrying KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL,
+// AUTH or PROXY (proxy URLs embed user:pass) — so a shell command
+// cannot exfiltrate daemon credentials through its logged output.
+// GIT_* names are exempt: they are git's own configuration namespace
+// (GIT_AUTHOR_NAME, GIT_CONFIG_KEY_*), not daemon credentials, and
+// stripping them breaks the shell's git while leaving GIT_CONFIG_COUNT
+// pointing at keys that no longer exist.
 func envScrubbed() []string {
 	var out []string
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
 		u := strings.ToUpper(name)
 		sensitive := false
-		for _, pat := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"} {
-			if strings.Contains(u, pat) {
-				sensitive = true
-				break
+		if !strings.HasPrefix(u, "GIT_") {
+			for _, pat := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "PROXY"} {
+				if strings.Contains(u, pat) {
+					sensitive = true
+					break
+				}
 			}
 		}
 		if !sensitive {
