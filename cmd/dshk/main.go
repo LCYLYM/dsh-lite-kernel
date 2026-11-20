@@ -20,6 +20,7 @@ import (
 	"github.com/LCYLYM/dsh-lite-kernel/agent"
 	"github.com/LCYLYM/dsh-lite-kernel/kernel"
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
+	"github.com/LCYLYM/dsh-lite-kernel/mcp"
 	"github.com/LCYLYM/dsh-lite-kernel/server"
 	"github.com/LCYLYM/dsh-lite-kernel/session"
 	"github.com/LCYLYM/dsh-lite-kernel/tools"
@@ -191,7 +192,53 @@ func provider() (llm.Provider, string) {
 	return &llm.OpenAIProvider{BaseURL: base, APIKey: key}, model
 }
 
-func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws string) func(*session.Session) *agent.Loop {
+// mcpFlags collects repeated -mcp "name=command args..." specs.
+type mcpFlags []string
+
+func (m *mcpFlags) String() string { return strings.Join(*m, " ") }
+func (m *mcpFlags) Set(v string) error {
+	*m = append(*m, v)
+	return nil
+}
+
+// connectMCPs spawns every -mcp server and lists its tools once. Any
+// spawn/handshake/list failure is loud at startup — a silently absent
+// toolset is the upstream failure mode (#13653). The returned cleanup
+// kills all children.
+func connectMCPs(specs mcpFlags) ([]agent.MCPTool, func(), error) {
+	var tools []agent.MCPTool
+	var clients []*mcp.Client
+	close := func() {
+		for _, c := range clients {
+			c.Close()
+		}
+	}
+	for _, spec := range specs {
+		name, cmdline, ok := strings.Cut(spec, "=")
+		fields := strings.Fields(cmdline)
+		if !ok || name == "" || len(fields) == 0 {
+			close()
+			return nil, nil, fmt.Errorf("bad -mcp spec %q (want name=command args...)", spec)
+		}
+		c, err := mcp.Connect(context.Background(), mcp.DefaultInitTimeout, fields[0], fields[1:]...)
+		if err != nil {
+			close()
+			return nil, nil, fmt.Errorf("mcp server %q: %w", name, err)
+		}
+		ts, err := agent.ListTools(c, name, mcp.DefaultCallTimeout)
+		if err != nil {
+			c.Close()
+			close()
+			return nil, nil, err
+		}
+		log.Printf("mcp server %q: %d tools", name, len(ts))
+		tools = append(tools, ts...)
+		clients = append(clients, c)
+	}
+	return tools, close, nil
+}
+
+func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws string, mcpTools []agent.MCPTool) func(*session.Session) *agent.Loop {
 	return func(ses *session.Session) *agent.Loop {
 		root := kernel.NewRoot("root")
 		sc, _ := root.Child("agent/" + ses.ID)
@@ -213,6 +260,9 @@ func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws st
 			AllowNet:         os.Getenv("DSHK_SHELL_NET") != "",
 		})
 		reg.Register(agent.PlanTool{Log: ses.Log})
+		for _, t := range mcpTools {
+			reg.Register(t)
+		}
 		b := session.DefaultBudget()
 		b.SystemText = "You are dsh-lite, a minimal agent. Use tools when needed."
 		return &agent.Loop{SessionID: ses.ID,
@@ -231,7 +281,15 @@ func cmdServe(args []string) {
 	// Prefer DSHK_TOKEN: a -token flag lands in `ps` output readable by
 	// other local users.
 	token := fs.String("token", "", "bearer token required on every request; prefer the DSHK_TOKEN env var — argv is visible in process listings")
+	var mcpSpecs mcpFlags
+	fs.Var(&mcpSpecs, "mcp", "MCP server spec 'name=command args...' (repeatable); tools register as mcp_<name>_<tool>")
 	_ = fs.Parse(args)
+
+	mcpTools, closeMCP, err := connectMCPs(mcpSpecs)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer closeMCP()
 
 	store, err := session.NewStore(*dir)
 	if err != nil {
@@ -253,7 +311,7 @@ func cmdServe(args []string) {
 	}
 	prov, model := provider()
 	srv := &server.Server{Store: store, Provider: prov, Model: model,
-		NewLoop: newLoopFactory(store, prov, model, *ws), Token: tok}
+		NewLoop: newLoopFactory(store, prov, model, *ws, mcpTools), Token: tok}
 
 	log.Printf("dsh-lite serving on http://%s (workspace %s)", *addr, *ws)
 
@@ -291,6 +349,8 @@ func cmdRun(args []string) {
 	dir := fs.String("data", ".dshk/sessions", "session data dir")
 	ws := fs.String("workspace", ".", "workspace root")
 	sid := fs.String("session", "", "existing session id to continue instead of creating one")
+	var mcpSpecs mcpFlags
+	fs.Var(&mcpSpecs, "mcp", "MCP server spec 'name=command args...' (repeatable)")
 	_ = fs.Parse(args)
 	wsSet := false
 	fs.Visit(func(f *flag.Flag) {
@@ -306,6 +366,12 @@ func cmdRun(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer store.Close()
+	mcpTools, closeMCP, err := connectMCPs(mcpSpecs)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer closeMCP()
 	var ses *session.Session
 	if *sid != "" {
 		if ses, err = store.Get(*sid); err != nil {
@@ -336,7 +402,7 @@ func cmdRun(args []string) {
 		log.Fatal(err)
 	}
 	prov, model := provider()
-	loop := newLoopFactory(store, prov, model, *ws)(ses)
+	loop := newLoopFactory(store, prov, model, *ws, mcpTools)(ses)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	state, err := loop.Run(ctx, fs.Arg(0))

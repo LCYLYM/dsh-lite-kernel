@@ -87,6 +87,10 @@ go build -o dshk ./cmd/dshk
 
 # Server
 ./dshk serve -addr 127.0.0.1:3080 -data .dshk/sessions -workspace /path/to/ws
+
+# Attach MCP servers (repeatable; tools register as mcp_<server>_<tool>,
+# spawn/handshake/tools-list failures are loud at startup)
+./dshk serve -mcp "fs=npx -y @modelcontextprotocol/server-filesystem /tmp" -mcp "web=python3 server.py"
 ```
 
 Every endpoint has a `dshk` subcommand against a running daemon
