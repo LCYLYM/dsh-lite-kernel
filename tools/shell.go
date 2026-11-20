@@ -167,7 +167,10 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	// tools that need a writable home (gocache, config) get /tmp. The
 	// daemon's credential-shaped variables never enter a model command —
 	// a logged `env` must not leak DEEPSEEK_API_KEY / DSHK_TOKEN.
-	cmd.Env = envWith(envScrubbed(), map[string]string{"HOME": "/tmp", "TMPDIR": "/tmp"})
+	// A command without network has no use for proxy/mirror
+	// credentials — scrub them too.
+	net := !sandboxed() || s.AllowNet
+	cmd.Env = envWith(envScrubbed(net), map[string]string{"HOME": "/tmp", "TMPDIR": "/tmp"})
 
 	max := s.MaxOutput
 	if max <= 0 {
@@ -206,15 +209,16 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 // GIT_AUTHOR_*/GIT_COMMITTER_*/GIT_CONFIG_* are the shell git's own
 // settings (stripping them breaks commits, and dropping the keys while
 // GIT_CONFIG_COUNT survives corrupts env-based config), and GOPROXY
-// selects the module mirror builds fetch through. Any other GIT_*
-// name — GIT_TOKEN and friends — stays scrub-checked.
-func envScrubbed() []string {
+// selects the module mirror builds fetch through — but only when the
+// command can reach the network at all. Any other GIT_* name —
+// GIT_TOKEN and friends — stays scrub-checked.
+func envScrubbed(net bool) []string {
 	var out []string
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
 		u := strings.ToUpper(name)
 		sensitive := false
-		if !benignShellConfig(u) {
+		if !benignShellConfig(u, net) {
 			for _, pat := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "PROXY"} {
 				if strings.Contains(u, pat) {
 					sensitive = true
@@ -229,13 +233,13 @@ func envScrubbed() []string {
 	return out
 }
 
-func benignShellConfig(u string) bool {
+func benignShellConfig(u string, net bool) bool {
 	for _, p := range []string{"GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"} {
 		if strings.HasPrefix(u, p) {
 			return true
 		}
 	}
-	return u == "GOPROXY"
+	return net && u == "GOPROXY"
 }
 
 func envWith(base []string, set map[string]string) []string {

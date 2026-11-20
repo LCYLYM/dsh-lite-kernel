@@ -158,8 +158,25 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 	if !strings.Contains(out, "GIT_AUTHOR_NAME=kernel-bot") {
 		t.Fatal("env scrub stripped git's own config namespace")
 	}
+	// GOPROXY is kept only for commands that can reach the network:
+	// unsandboxed (host net) or AllowNet. In the default no-net sandbox
+	// it is scrubbed like any other credential-bearing proxy var.
+	net := !sandboxed()
+	if !net {
+		if strings.Contains(out, "GOPROXY=") {
+			t.Fatal("no-net sandbox kept GOPROXY credentials")
+		}
+		t.Setenv("DSHK_TEST_TOKEN_X", "leak-me")
+		s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second, AllowNet: true}
+		args, _ := json.Marshal(map[string]string{"cmd": "env"})
+		raw, err := s.Call(context.Background(), args)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		out = raw.(map[string]any)["output"].(string)
+	}
 	if !strings.Contains(out, "GOPROXY=https://user:pass@goproxy.corp") {
-		t.Fatal("env scrub dropped GOPROXY — builds cannot fetch modules")
+		t.Fatal("env scrub dropped GOPROXY from a networked command")
 	}
 }
 
