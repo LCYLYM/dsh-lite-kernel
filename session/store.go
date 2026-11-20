@@ -133,20 +133,34 @@ func (s *Store) Fork(id string) (*Session, error) {
 	if err := ses.Log.reindex(); err != nil {
 		return fail(err)
 	}
+	// A cold fork copies the source's session/meta verbatim — read the
+	// real workspace back rather than trusting the live map, or this
+	// session's tools root at the daemon's until a reload.
+	if w, _ := readSessionMeta(ses.Log); w != "" {
+		ses.Workspace = w
+	}
 	return ses, nil
 }
 
 // create allocates a fresh on-disk session: the id loop never reuses a
 // name that exists on disk — after a restart seq is reseeded, and a
 // reused name would reopen (or truncate) another session's log.
-func (s *Store) create(workspace string) (*Session, error) {
-	// Record the absolute path: "." means the creating process's cwd,
-	// which a later daemon serving the same store cannot reconstruct.
-	if workspace != "" {
-		if abs, err := filepath.Abs(workspace); err == nil {
-			workspace = abs
-		}
+// normalizeWorkspace records only absolute paths: "." means the
+// creating process's cwd, which a later daemon serving the same store
+// cannot reconstruct — and relative-vs-absolute pairs must compare
+// equal in reuse lookups.
+func normalizeWorkspace(w string) string {
+	if w == "" {
+		return w
 	}
+	if abs, err := filepath.Abs(w); err == nil {
+		return abs
+	}
+	return w
+}
+
+func (s *Store) create(workspace string) (*Session, error) {
+	workspace = normalizeWorkspace(workspace)
 	for {
 		s.seq++
 		id := fmt.Sprintf("session-%d-%d", time.Now().UnixNano(), s.seq)
@@ -176,6 +190,26 @@ func (s *Store) create(workspace string) (*Session, error) {
 	}
 }
 
+// readSessionMeta pulls the recorded workspace and creation time out
+// of a log's session/meta event (""/0 when the log predates it).
+func readSessionMeta(lg *Log) (ws string, at int64) {
+	_ = lg.ReadFrom(0, func(ev Event) bool {
+		if ev.Type != "session/meta" {
+			return true
+		}
+		var m struct {
+			Workspace string `json:"workspace"`
+			CreatedAt int64  `json:"created_at"`
+		}
+		if json.Unmarshal(ev.Data, &m) == nil {
+			ws = m.Workspace
+			at = m.CreatedAt
+		}
+		return false
+	})
+	return ws, at
+}
+
 // CreateOrReuseBlank returns an existing blank session for workspace if
 // one exists — under the store lock, so concurrent and out-of-order
 // callers can't mint unbounded blanks (#13624, #13646). A "blank" has no
@@ -183,6 +217,10 @@ func (s *Store) create(workspace string) (*Session, error) {
 func (s *Store) CreateOrReuseBlank(workspace string) (*Session, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Normalize before comparing: recorded workspaces are absolute, so
+	// a raw relative input would miss every reuse and mint a new blank
+	// per request.
+	workspace = normalizeWorkspace(workspace)
 	for _, ses := range s.live {
 		if ses.Workspace != workspace {
 			continue
@@ -225,22 +263,7 @@ func (s *Store) Get(id string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ws string
-	var at int64
-	_ = lg.ReadFrom(0, func(ev Event) bool {
-		if ev.Type != "session/meta" {
-			return true
-		}
-		var m struct {
-			Workspace string `json:"workspace"`
-			CreatedAt int64  `json:"created_at"`
-		}
-		if json.Unmarshal(ev.Data, &m) == nil {
-			ws = m.Workspace
-			at = m.CreatedAt
-		}
-		return false
-	})
+	ws, at := readSessionMeta(lg)
 	ses := &Session{ID: id, Workspace: ws, Log: lg, CreatedAt: at}
 	// Older logs predate session/meta; the first event's timestamp is a
 	// cheap stand-in (one line read, no full replay).

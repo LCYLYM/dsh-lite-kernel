@@ -250,17 +250,17 @@ func connectMCPs(specs mcpFlags) ([]agent.MCPTool, func(), error) {
 	return tools, close, nil
 }
 
-func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws string, mcpTools []agent.MCPTool) func(*session.Session) *agent.Loop {
+func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws string, mcpTools []agent.MCPTool, adoptRecorded bool) func(*session.Session) *agent.Loop {
 	return func(ses *session.Session) *agent.Loop {
 		root := kernel.NewRoot("root")
 		sc, _ := root.Child("agent/" + ses.ID)
 		reg := agent.NewRegistry(sc, 60*time.Second)
-		// The session's recorded workspace wins over the serve-time
-		// default — same adoption rule as `run -session`: tools act
+		// serve honors the session's recorded workspace — tools act
 		// where the session was created. Sessions recorded with ""
-		// (daemon-rooted) keep the serve-time root.
+		// (daemon-rooted) keep the serve-time root. run opts out: it
+		// already resolved the flag-vs-recorded rule before this call.
 		toolRoot := ws
-		if ses.Workspace != "" {
+		if adoptRecorded && ses.Workspace != "" {
 			toolRoot = ses.Workspace
 		}
 		w := tools.Workspace{Root: toolRoot}
@@ -333,7 +333,7 @@ func cmdServe(args []string) {
 	}
 	prov, model := provider()
 	srv := &server.Server{Store: store, Provider: prov, Model: model,
-		NewLoop: newLoopFactory(store, prov, model, *ws, mcpTools), Token: tok}
+		NewLoop: newLoopFactory(store, prov, model, *ws, mcpTools, true), Token: tok}
 
 	log.Printf("dsh-lite serving on http://%s (workspace %s)", *addr, *ws)
 
@@ -424,7 +424,9 @@ func cmdRun(args []string) {
 		log.Fatal(err)
 	}
 	prov, model := provider()
-	loop := newLoopFactory(store, prov, model, *ws, mcpTools)(ses)
+	// run resolves the workspace itself above (-workspace flag wins over
+	// the recorded one); the factory must not re-adopt it.
+	loop := newLoopFactory(store, prov, model, *ws, mcpTools, false)(ses)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	state, err := loop.Run(ctx, fs.Arg(0))
