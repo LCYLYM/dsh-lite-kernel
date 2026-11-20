@@ -5,9 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"syscall"
+	"time"
 )
+
+// validID constrains caller-supplied session ids so they can never
+// escape the data dir through "../" or separators.
+var validID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 
 // Session is a durable conversation: a log plus metadata.
 type Session struct {
@@ -48,18 +54,6 @@ func NewStore(dir string) (*Store, error) {
 	return &Store{dir: dir, live: map[string]*Session{}, lockf: lf}, nil
 }
 
-// Close releases the store lock. Session logs it opened stay owned by
-// their callers.
-func (s *Store) Close() error {
-	if s.lockf == nil {
-		return nil
-	}
-	err := syscall.Flock(int(s.lockf.Fd()), syscall.LOCK_UN)
-	cerr := s.lockf.Close()
-	s.lockf = nil
-	return errors.Join(err, cerr)
-}
-
 // Create opens a fresh session.
 func (s *Store) Create(workspace string) (*Session, error) {
 	s.mu.Lock()
@@ -69,13 +63,15 @@ func (s *Store) Create(workspace string) (*Session, error) {
 
 func (s *Store) create(workspace string) (*Session, error) {
 	s.seq++
-	id := fmt.Sprintf("session-%d-%d", s.seq, len(s.live)+1)
+	// Time-based component: two `dshk run`s on the same data dir must not
+	// mint the same id and silently share a log.
+	id := fmt.Sprintf("session-%d-%d", time.Now().UnixNano(), s.seq)
 	path := filepath.Join(s.dir, id+".jsonl")
 	lg, err := OpenLog(path)
 	if err != nil {
 		return nil, err
 	}
-	ses := &Session{ID: id, Workspace: workspace, Log: lg}
+	ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: time.Now().Unix()}
 	s.live[id] = ses
 	return ses, nil
 }
@@ -114,6 +110,9 @@ func (s *Store) Get(id string) (*Session, error) {
 	if ses, ok := s.live[id]; ok {
 		return ses, nil
 	}
+	if !validID.MatchString(id) {
+		return nil, fmt.Errorf("session: invalid session id %q", id)
+	}
 	path := filepath.Join(s.dir, id+".jsonl")
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("session: no such session %q", id)
@@ -123,8 +122,33 @@ func (s *Store) Get(id string) (*Session, error) {
 		return nil, err
 	}
 	ses := &Session{ID: id, Log: lg}
+	// CreatedAt isn't persisted; the first event's timestamp is a cheap
+	// stand-in (one line read, no full replay).
+	var first Event
+	if err := lg.ReadFrom(0, func(ev Event) bool { first = ev; return false }); err == nil && !first.At.IsZero() {
+		ses.CreatedAt = first.At.Unix()
+	}
 	s.live[id] = ses
 	return ses, nil
+}
+
+// Close flushes and closes every live session log, then releases the
+// store lock; call it on shutdown so no buffered write is lost. The
+// store stays usable for List but Get recreates sessions lazily.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, ses := range s.live {
+		ses.Log.Close()
+		delete(s.live, id)
+	}
+	if s.lockf == nil {
+		return nil
+	}
+	err := syscall.Flock(int(s.lockf.Fd()), syscall.LOCK_UN)
+	cerr := s.lockf.Close()
+	s.lockf = nil
+	return errors.Join(err, cerr)
 }
 
 // List returns live session ids (a lock-held snapshot, never a stale copy).
