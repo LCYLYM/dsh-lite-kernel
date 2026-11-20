@@ -483,3 +483,25 @@ func TestReadFromSurfacesCorruption(t *testing.T) {
 		t.Fatalf("partial tail should be tolerated: %v n=%d", err, n)
 	}
 }
+
+// MaxEvents=0 must not hang: nothing fits, so the window never widens.
+func TestBuildContextZeroEvents(t *testing.T) {
+	lg, err := OpenLog(filepath.Join(t.TempDir(), "z.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Append("user/message", map[string]any{"role": "user", "content": "hi"})
+	done := make(chan []llm.Message, 1)
+	go func() {
+		m, _ := BuildContext(lg, ContextBudget{MaxEvents: 0, MaxBytes: 1 << 10, SystemText: "sys"})
+		done <- m
+	}()
+	select {
+	case m := <-done:
+		if len(m) != 1 || m[0].Role != "system" {
+			t.Fatalf("msgs %v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BuildContext hung")
+	}
+}

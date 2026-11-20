@@ -41,14 +41,17 @@ type messageEvent struct {
 // stateless-"continue" re-run loop, discussion #13647).
 func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 	var msgs []llm.Message
-	used := 0
-	count := 0
-	// Tail-scan: read the affordable window, iterate backward.
-	tail, err := lg.Tail(b.MaxEvents * 4) // read a window wider than we keep
-	if err != nil {
-		return nil, err
+	if b.MaxEvents <= 0 {
+		// No history fits — the zero window could never widen out of
+		// itself, so don't enter the widening loop at all.
+		if b.SystemText != "" {
+			return []llm.Message{{Role: "system", Content: b.SystemText}}, nil
+		}
+		return msgs, nil
 	}
 	var rev []llm.Message
+	used := 0
+	count := 0
 	// The newest compaction marker is the history floor: events with
 	// seq <= ThroughSeq are folded; the retained tail between ThroughSeq
 	// and the marker is ordinary history and must still be kept. The
@@ -58,88 +61,113 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 	floor := lg.CompactedThrough()
 	comp := lg.NewestCompaction()
 	seenNotices := map[string]bool{}
-	for i := len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
-		ev := tail[i]
-		if ev.Seq <= floor {
-			break
+	// Tail-scan: read a window wider than we keep, iterate backward. The
+	// window widens while it fills with non-rendered control events —
+	// mailbox/delivered acknowledgements must never crowd the injected
+	// notices they acknowledge out of context (a flooded mailbox would
+	// otherwise leave the model blind to input already acked).
+	for window := b.MaxEvents * 4; ; window *= 2 {
+		if window > int(lg.Len()) {
+			window = int(lg.Len())
 		}
-		var me messageEvent
-		var m llm.Message
-		switch ev.Type {
-		case "user/message":
-			if err := json.Unmarshal(ev.Data, &me); err != nil {
-				continue
+		tail, err := lg.Tail(window)
+		if err != nil {
+			return nil, err
+		}
+		rev, used, count = rev[:0], 0, 0
+		for k := range seenNotices {
+			delete(seenNotices, k)
+		}
+		var i int
+		for i = len(tail) - 1; i >= 0 && count < b.MaxEvents && used < b.MaxBytes; i-- {
+			ev := tail[i]
+			if ev.Seq <= floor {
+				break
 			}
-			// Retry markers are control metadata, never serialized as empty
-			// user messages — that poisons strict providers (#13715).
-			if me.Role == "" || me.Content == nil {
-				continue
-			}
-			m = llm.Message{Role: "user", Content: me.Content}
-		case "assistant/message":
-			if err := json.Unmarshal(ev.Data, &me); err != nil {
-				continue
-			}
-			m = llm.Message{Role: "assistant", Content: me.Content}
-			if len(me.ToolCalls) > 0 {
-				var tcs []llm.ToolCall
-				if err := json.Unmarshal(me.ToolCalls, &tcs); err == nil {
-					m.ToolCalls = tcs
+			var me messageEvent
+			var m llm.Message
+			switch ev.Type {
+			case "user/message":
+				if err := json.Unmarshal(ev.Data, &me); err != nil {
+					continue
 				}
-			}
-			if me.Truncated {
-				m.Content = appendText(m.Content, "\n[output was truncated at the token limit; continue from where it stopped, do not restart]")
-			}
-		case "tool/result":
-			if err := json.Unmarshal(ev.Data, &me); err != nil {
-				continue
-			}
-			m = llm.Message{Role: "tool", Content: me.Content, ToolCallID: me.ToolCallID}
-		case "mailbox/inject":
-			var inj struct {
-				Notices []struct {
-					ID      string          `json:"id"`
-					From    string          `json:"from"`
-					Kind    string          `json:"kind"`
-					Payload json.RawMessage `json:"payload"`
-				} `json:"notices"`
-			}
-			if err := json.Unmarshal(ev.Data, &inj); err != nil || len(inj.Notices) == 0 {
-				continue
-			}
-			var sb strings.Builder
-			for _, n := range inj.Notices {
-				// A crash between inject and ack reinjects the notice on
-				// resume — render each id once so duplicates stay invisible.
-				// ID-less notices are never deduped: "" would merge them all.
-				if n.ID != "" {
-					if seenNotices[n.ID] {
-						continue
+				// Retry markers are control metadata, never serialized as empty
+				// user messages — that poisons strict providers (#13715).
+				if me.Role == "" || me.Content == nil {
+					continue
+				}
+				m = llm.Message{Role: "user", Content: me.Content}
+			case "assistant/message":
+				if err := json.Unmarshal(ev.Data, &me); err != nil {
+					continue
+				}
+				m = llm.Message{Role: "assistant", Content: me.Content}
+				if len(me.ToolCalls) > 0 {
+					var tcs []llm.ToolCall
+					if err := json.Unmarshal(me.ToolCalls, &tcs); err == nil {
+						m.ToolCalls = tcs
 					}
-					seenNotices[n.ID] = true
 				}
-				fmt.Fprintf(&sb, "[mailbox notice from %s (%s)] %s\n", n.From, n.Kind, n.Payload)
-			}
-			if sb.Len() == 0 {
+				if me.Truncated {
+					m.Content = appendText(m.Content, "\n[output was truncated at the token limit; continue from where it stopped, do not restart]")
+				}
+			case "tool/result":
+				if err := json.Unmarshal(ev.Data, &me); err != nil {
+					continue
+				}
+				m = llm.Message{Role: "tool", Content: me.Content, ToolCallID: me.ToolCallID}
+			case "mailbox/inject":
+				var inj struct {
+					Notices []struct {
+						ID      string          `json:"id"`
+						From    string          `json:"from"`
+						Kind    string          `json:"kind"`
+						Payload json.RawMessage `json:"payload"`
+					} `json:"notices"`
+				}
+				if err := json.Unmarshal(ev.Data, &inj); err != nil || len(inj.Notices) == 0 {
+					continue
+				}
+				var sb strings.Builder
+				for _, n := range inj.Notices {
+					// A crash between inject and ack reinjects the notice on
+					// resume — render each id once so duplicates stay invisible.
+					// ID-less notices are never deduped: "" would merge them all.
+					if n.ID != "" {
+						if seenNotices[n.ID] {
+							continue
+						}
+						seenNotices[n.ID] = true
+					}
+					fmt.Fprintf(&sb, "[mailbox notice from %s (%s)] %s\n", n.From, n.Kind, n.Payload)
+				}
+				if sb.Len() == 0 {
+					continue
+				}
+				m = llm.Message{Role: "user", Content: strings.TrimRight(sb.String(), "\n")}
+			default:
 				continue
 			}
-			m = llm.Message{Role: "user", Content: strings.TrimRight(sb.String(), "\n")}
-		default:
-			continue
+			// Charge the wire message, not the log event — logged fields a
+			// provider never sees (usage counters, finish markers) must not
+			// evict history.
+			size := len(ev.Data)
+			if w, err := json.Marshal(m); err == nil {
+				size = len(w)
+			}
+			if used+size > b.MaxBytes && len(rev) > 0 {
+				break
+			}
+			used += size
+			count++
+			rev = append(rev, m)
 		}
-		// Charge the wire message, not the log event — logged fields a
-		// provider never sees (usage counters, finish markers) must not
-		// evict history.
-		size := len(ev.Data)
-		if w, err := json.Marshal(m); err == nil {
-			size = len(w)
-		}
-		if used+size > b.MaxBytes && len(rev) > 0 {
+		// Exhausting the window before the budget filled (cap hit
+		// mid-window, i >= 0) means older history could not fit anyway —
+		// widening would just load the entire log.
+		if i >= 0 || len(tail) < window || window >= int(lg.Len()) {
 			break
 		}
-		used += size
-		count++
-		rev = append(rev, m)
 	}
 	// A turn that crashed between the assistant tool_call and its
 	// tool/result leaves a dangling call in the log; strict providers
