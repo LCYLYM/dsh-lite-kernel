@@ -140,3 +140,45 @@ func TestMailboxDurableReplay(t *testing.T) {
 		t.Fatal("notice not acked")
 	}
 }
+
+// A same-named tool in a child scope shadows the parent's: Call resolves
+// the shadowing one, and Specs advertises it only once.
+func TestRegistryChildShadowsParentTool(t *testing.T) {
+	root := kernel.NewRoot("root")
+	parent := NewRegistry(root, 0)
+	parent.Register(tools.Echo{})
+
+	child, err := root.Child("agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(child, 0)
+	reg.Register(tools.WriteFile{W: tools.Workspace{Root: t.TempDir()}})
+
+	specs := reg.Specs()
+	names := map[string]int{}
+	for _, s := range specs {
+		names[s.Name]++
+	}
+	if names["echo"] != 1 || names["write_file"] != 1 {
+		t.Fatalf("unexpected specs: %v", names)
+	}
+
+	// Register a shadowing echo in the child: still one spec, resolved child-first.
+	root2 := kernel.NewRoot("root2")
+	p2 := NewRegistry(root2, 0)
+	p2.Register(tools.Echo{})
+	c2, _ := root2.Child("agent")
+	reg2 := NewRegistry(c2, 0)
+	reg2.Register(tools.Echo{})
+	specs2 := reg2.Specs()
+	count := 0
+	for _, s := range specs2 {
+		if s.Name == "echo" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("shadowed tool advertised %d times", count)
+	}
+}
