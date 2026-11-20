@@ -2,6 +2,8 @@ package server
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -117,6 +119,67 @@ func TestStreamResumeFromSeq(t *testing.T) {
 	case <-got:
 	case <-time.After(3 * time.Second):
 		t.Fatal("no live event after resume")
+	}
+}
+
+type holdProvider struct{ gate chan struct{} }
+
+func (p *holdProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	<-p.gate
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestPostMessageBusyConflict(t *testing.T) {
+	st, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	srv := &Server{
+		Store: st, Provider: &llm.EchoProvider{}, Model: "echo",
+		NewLoop: func(ses *session.Session) *agent.Loop {
+			root := kernel.NewRoot("root")
+			sc, _ := root.Child("a")
+			reg := agent.NewRegistry(sc, time.Second)
+			return &agent.Loop{
+				Model: "echo", Provider: &holdProvider{gate: gate}, Registry: reg, Log: ses.Log,
+				Budget: session.DefaultBudget(), Guard: agent.DefaultGuard(),
+				Retry: llm.Policy{Retries: 0},
+			}
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	res, err := http.Post(ts.URL+"/v1/sessions", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(res.Body).Decode(&created)
+	res.Body.Close()
+
+	post := func() int {
+		r, err := http.Post(ts.URL+"/v1/sessions/"+created.ID+"/messages",
+			"application/json", strings.NewReader(`{"text":"hi"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+	if code := post(); code != 200 {
+		t.Fatalf("first post: %d", code)
+	}
+	time.Sleep(100 * time.Millisecond) // let the turn reach Complete
+	if code := post(); code != http.StatusConflict {
+		t.Fatalf("busy post: %d, want 409", code)
+	}
+	close(gate)
+	time.Sleep(100 * time.Millisecond)
+	if code := post(); code != 200 {
+		t.Fatalf("post after turn end: %d", code)
 	}
 }
 

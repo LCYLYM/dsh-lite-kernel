@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
@@ -36,11 +37,34 @@ type Loop struct {
 	AutoResume bool // re-drive the turn after Waiting (goal runs, #13621)
 	ResumeMax  int
 	Stream     bool // prefer Streamer providers; deltas land in the log
+
+	turnMu sync.Mutex // one in-flight turn per log — see Run
+}
+
+// ErrTurnBusy is returned when a second Run starts while a turn is in
+// flight on the same log.
+var ErrTurnBusy = errors.New("agent: turn already in progress")
+
+// Busy reports whether a turn is in flight. It is a probe for callers
+// that want to reject early; Run still enforces the exclusion itself.
+func (l *Loop) Busy() bool {
+	if !l.turnMu.TryLock() {
+		return true
+	}
+	l.turnMu.Unlock()
+	return false
 }
 
 // Run executes one user turn: append the message, step the loop under the
-// guard, persist every model-visible event.
+// guard, persist every model-visible event. Two concurrent Runs on the
+// same log would interleave events (user B's message landing mid-turn A)
+// — the second caller gets ErrTurnBusy, a caller-visible rejection rather
+// than a silently corrupted history.
 func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
+	if !l.turnMu.TryLock() {
+		return Failed, ErrTurnBusy
+	}
+	defer l.turnMu.Unlock()
 	if _, err := l.Log.Append("user/message", map[string]any{
 		"role": "user", "content": userText,
 	}); err != nil {
