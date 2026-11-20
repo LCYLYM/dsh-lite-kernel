@@ -77,6 +77,18 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
+		// Check spend before billing another call — an exhausted
+		// session aborts without contacting the provider (also covers
+		// reopened logs, where only durable usage survives).
+		if l.Guard.MaxSessionTokens > 0 {
+			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+				l.Log.Append("turn/end", map[string]any{
+					"reason": "aborted",
+					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
+				})
+				return Aborted, errors.New("agent: session token budget exceeded")
+			}
+		}
 		if err := Drain(l.Log); err != nil {
 			return Failed, err
 		}
@@ -123,11 +135,31 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 
 		text := contentText(resp.Message.Content)
 		truncated := resp.FinishReason == "length" || resp.FinishReason == "max_tokens"
-		l.Log.Append("assistant/message", map[string]any{
+		// Usage rides on the message event itself: one atomic append —
+		// a crash between the two can never lose usage a reply saved,
+		// and accounting costs zero extra events in the log.
+		ev := map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
 			"finish":     resp.FinishReason, "truncated": truncated,
-		})
+		}
+		if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+			ev["prompt_tokens"] = resp.Usage.InputTokens
+			ev["completion_tokens"] = resp.Usage.OutputTokens
+		}
+		l.Log.Append("assistant/message", ev)
+
+		// Crossing the cap aborts before tool side effects — this
+		// step's tool calls do not run. Same ordering as the guards.
+		if l.Guard.MaxSessionTokens > 0 {
+			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+				l.Log.Append("turn/end", map[string]any{
+					"reason": "aborted",
+					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
+				})
+				return Aborted, errors.New("agent: session token budget exceeded")
+			}
+		}
 
 		// Guard: repetition / no-progress / caps.
 		if abort, why := l.Guard.CheckStep(text, len(resp.Message.ToolCalls)); abort {

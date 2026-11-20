@@ -16,6 +16,7 @@ type Guard struct {
 	RepeatWindow     int // trailing chars inspected for n-gram spam
 	RepeatThreshold  int // repeats of the same short n-gram that trigger abort
 	MaxOutputChars   int // per-step visible-output cap
+	MaxSessionTokens int // lifetime prompt+completion tokens; 0 = unbounded
 }
 
 func DefaultGuard() Guard {
@@ -25,6 +26,7 @@ func DefaultGuard() Guard {
 		RepeatWindow:     4096,
 		RepeatThreshold:  40,
 		MaxOutputChars:   256 << 10,
+		MaxSessionTokens: 2_000_000,
 	}
 }
 
