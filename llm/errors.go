@@ -90,22 +90,26 @@ func Classify(resp *http.Response, body []byte, err error) *CallError {
 	}
 	ce.Message = msg
 
+	// Provider error vocabularies are case-erratic ("RateLimitExceeded",
+	// "THROTTLING", "QuotaExceeded"); fold once and match on the folded
+	// string or a mislabeled retryable fault degrades to KindInvalid.
+	lc := strings.ToLower(code + typ)
+	lcMsg := strings.ToLower(msg)
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
 		// 429 is throttling by definition; parse Retry-After.
 		ce.Kind = KindRateLimit
 		ce.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
-	case strings.Contains(code+typ, "rate_limit") || strings.Contains(code+typ, "throttl"):
+	case strings.Contains(lc, "rate_limit") || strings.Contains(lc, "ratelimit") || strings.Contains(lc, "throttl"):
 		ce.Kind = KindRateLimit
 	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusGatewayTimeout || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable:
 		ce.Kind = KindTransient
 	case resp.StatusCode >= 500:
 		ce.Kind = KindTransient
-	case strings.Contains(code+typ+strings.ToLower(msg), "content_filter") ||
-		strings.Contains(strings.ToLower(code+typ), "moderation"):
+	case strings.Contains(lc+lcMsg, "content_filter") || strings.Contains(lc, "moderation"):
 		ce.Kind = KindContentFilter
-	case strings.Contains(code+typ, "quota") || strings.Contains(code+typ, "insufficient") ||
-		strings.Contains(strings.ToLower(code+typ+msg), "balance"):
+	case strings.Contains(lc, "quota") || strings.Contains(lc, "insufficient") ||
+		strings.Contains(lc+lcMsg, "balance"):
 		// Genuine balance exhaustion, reached only on non-429 responses.
 		ce.Kind = KindQuota
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
