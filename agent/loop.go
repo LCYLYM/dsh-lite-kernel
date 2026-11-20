@@ -192,7 +192,9 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 		// cannot fit the budget, fold history before it happens again
 		// (deterministic — no model call, no route to misconfigure).
 		if l.shouldCompact(msgs) {
-			l.compact()
+			if err := l.compact(); err != nil {
+				return Failed, err
+			}
 			if msgs, err = session.BuildContext(l.Log, l.Budget); err != nil {
 				return Failed, err
 			}
@@ -429,13 +431,18 @@ func (l *Loop) shouldCompact(msgs []llm.Message) bool {
 	return l.Log.Len()-l.Log.CompactedThrough() > window
 }
 
-func (l *Loop) compact() {
+func (l *Loop) compact() error {
 	through := l.Log.Len() - int64(l.Budget.MaxEvents)
 	if err := session.Compact(l.Log, through); err != nil {
 		// Best effort: a failed marker write must not mask the original
-		// compaction error.
-		_, _ = l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()})
+		// compaction error — and the marker itself is a durable write,
+		// so a failed append ends the turn like every other one.
+		if _, aerr := l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()}); aerr != nil {
+			return aerr
+		}
+		return err
 	}
+	return nil
 }
 
 // streamStep runs one model call through Streamer, logging throttled
