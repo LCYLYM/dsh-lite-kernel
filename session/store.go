@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -182,6 +184,10 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
+// List returns every session the store can serve: live ones plus the
+// session-*.jsonl files on disk — a persisted session must be
+// discoverable before it is first loaded (upstream #13812: disk
+// enumeration silently dropped a healthy session).
 // Release evicts a session from the live map and closes its log. The
 // session reloads on the next Get — live memory should track working
 // sessions, not every session ever touched.
@@ -221,9 +227,25 @@ func (s *Store) Close() error {
 func (s *Store) List() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ids := make([]string, 0, len(s.live))
+	seen := map[string]bool{}
 	for id := range s.live {
+		seen[id] = true
+	}
+	entries, _ := os.ReadDir(s.dir)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			continue
+		}
+		if !strings.HasPrefix(name, "session-") || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		seen[strings.TrimSuffix(name, ".jsonl")] = true
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
 		ids = append(ids, id)
 	}
+	sort.Strings(ids)
 	return ids
 }

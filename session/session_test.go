@@ -111,6 +111,35 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	}
 }
 
+// A session file on disk must appear in List even before it is loaded
+// (upstream #13812: a healthy session vanished from the listing).
+func TestListIncludesPersistedSessions(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	st1, _ := NewStore(dataDir)
+	ses, err := st1.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second store has nothing live yet; the file must still list.
+	st1.Close() // exclusive store lock — release before reopening
+	st2, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	found := false
+	for _, id := range st2.List() {
+		if id == ses.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("persisted session %s missing from List", ses.ID)
+	}
+}
+
 // A session reloaded from disk keeps its workspace binding — the meta
 // event rides in the log, not in process memory.
 func TestWorkspaceSurvivesReload(t *testing.T) {
