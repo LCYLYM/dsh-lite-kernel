@@ -9,7 +9,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -34,6 +36,7 @@ type Log struct {
 	nextSeq int64
 	subs    map[chan Event]struct{}
 	compact *Compaction // newest session/compaction marker, if any
+	onClose []func()
 }
 
 // OpenLog opens (or creates) the log at path and rebuilds its offset index.
@@ -101,7 +104,10 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	off, _ := l.f.Seek(0, 2)
+	off, err := l.f.Seek(0, 2)
+	if err != nil {
+		return Event{}, err
+	}
 	if _, err := l.f.Write(append(line, '\n')); err != nil {
 		return Event{}, err
 	}
@@ -152,10 +158,16 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 				if !fn(ev) {
 					return nil
 				}
+			} else if !(err != nil && err.Error() == "EOF") {
+				// A bad line mid-log is corruption — surface it rather
+				// than silently shrinking history. A partial last line
+				// (crash mid-append) is tolerated: it was never
+				// committed.
+				return fmt.Errorf("session: corrupt event after seq %d: %w", after, jerr)
 			}
 		}
 		if err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -165,6 +177,9 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 
 // Tail returns up to n trailing events — O(n), no full scan.
 func (l *Log) Tail(n int) ([]Event, error) {
+	if n <= 0 {
+		return nil, nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	start := l.nextSeq - 1 - int64(n)
@@ -194,9 +209,24 @@ func (l *Log) Subscribe(buf int) (<-chan Event, func()) {
 	}
 }
 
-// Close flushes and closes the log file.
+// Close flushes, closes the log file, and runs registered cleanups —
+// indexes keyed on this log (mailbox, projections) release here rather
+// than pinning a closed log forever.
 func (l *Log) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.f.Close()
+	cbs := l.onClose
+	l.onClose = nil
+	err := l.f.Close()
+	l.mu.Unlock()
+	for _, fn := range cbs {
+		fn()
+	}
+	return err
+}
+
+// OnClose registers fn to run once when Close is called.
+func (l *Log) OnClose(fn func()) {
+	l.mu.Lock()
+	l.onClose = append(l.onClose, fn)
+	l.mu.Unlock()
 }

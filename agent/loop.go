@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
@@ -34,6 +35,7 @@ type Loop struct {
 	Retry      llm.Policy
 	AutoResume bool // re-drive the turn after Waiting (goal runs, #13621)
 	ResumeMax  int
+	Stream     bool // prefer Streamer providers; deltas land in the log
 }
 
 // Run executes one user turn: append the message, step the loop under the
@@ -75,6 +77,9 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
+		if err := Drain(l.Log); err != nil {
+			return Failed, err
+		}
 		msgs, err := session.BuildContext(l.Log, l.Budget)
 		if err != nil {
 			return Failed, err
@@ -89,13 +94,20 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			}
 		}
 		var resp *llm.Response
+		req := &llm.Request{
+			Model:    l.Model,
+			Messages: msgs,
+			Tools:    l.Registry.Specs(),
+		}
 		err = l.Retry.Do(ctx, func(c context.Context) error {
 			var e error
-			resp, e = l.Provider.Complete(c, &llm.Request{
-				Model:    l.Model,
-				Messages: msgs,
-				Tools:    l.Registry.Specs(),
-			})
+			if l.Stream {
+				if st, ok := l.Provider.(llm.Streamer); ok {
+					resp, e = l.streamStep(c, st, req)
+					return e
+				}
+			}
+			resp, e = l.Provider.Complete(c, req)
 			return e
 		})
 		if err != nil {
@@ -172,6 +184,35 @@ func (l *Loop) compact() {
 	if err := session.Compact(l.Log, through); err != nil {
 		l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()})
 	}
+}
+
+// streamStep runs one model call through Streamer, logging throttled
+// assistant/delta events so the live feed shows progress without an
+// event per token (bounded log: deltas coalesce to ~4 KiB).
+func (l *Loop) streamStep(ctx context.Context, st llm.Streamer, req *llm.Request) (*llm.Response, error) {
+	var pending strings.Builder
+	flush := func() {
+		if pending.Len() == 0 {
+			return
+		}
+		l.Log.Append("assistant/delta", map[string]any{"text": pending.String()})
+		pending.Reset()
+	}
+	resp, err := st.Stream(ctx, req, func(d llm.Delta) error {
+		if d.Text != "" {
+			pending.WriteString(d.Text)
+			if pending.Len() >= 4096 {
+				flush()
+			}
+		}
+		if d.ToolName != "" {
+			flush()
+			l.Log.Append("assistant/tool-intent", map[string]any{"name": d.ToolName, "index": d.CallIndex})
+		}
+		return ctx.Err()
+	})
+	flush()
+	return resp, err
 }
 
 func contentText(c any) string {
