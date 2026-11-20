@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,7 @@ type Loop struct {
 	Retry      llm.Policy
 	AutoResume bool // re-drive the turn after Waiting (goal runs, #13621)
 	ResumeMax  int
+	Stream     bool // prefer Streamer providers; deltas land in the log
 
 	turnMu sync.Mutex // one in-flight turn per log — see Run
 }
@@ -99,18 +101,49 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
+		// Check spend before billing another call — an exhausted
+		// session aborts without contacting the provider (also covers
+		// reopened logs, where only durable usage survives).
+		if l.Guard.MaxSessionTokens > 0 {
+			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+				l.Log.Append("turn/end", map[string]any{
+					"reason": "aborted",
+					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
+				})
+				return Aborted, errors.New("agent: session token budget exceeded")
+			}
+		}
+		if err := Drain(l.Log); err != nil {
+			return Failed, err
+		}
 		msgs, err := session.BuildContext(l.Log, l.Budget)
 		if err != nil {
 			return Failed, err
 		}
+		// Pressure compaction: when the retained history window alone
+		// cannot fit the budget, fold history before it happens again
+		// (deterministic — no model call, no route to misconfigure).
+		if l.shouldCompact(msgs) {
+			l.compact()
+			if msgs, err = session.BuildContext(l.Log, l.Budget); err != nil {
+				return Failed, err
+			}
+		}
 		var resp *llm.Response
+		req := &llm.Request{
+			Model:    l.Model,
+			Messages: msgs,
+			Tools:    l.Registry.Specs(),
+		}
 		err = l.Retry.Do(ctx, func(c context.Context) error {
 			var e error
-			resp, e = l.Provider.Complete(c, &llm.Request{
-				Model:    l.Model,
-				Messages: msgs,
-				Tools:    l.Registry.Specs(),
-			})
+			if l.Stream {
+				if st, ok := l.Provider.(llm.Streamer); ok {
+					resp, e = l.streamStep(c, st, req)
+					return e
+				}
+			}
+			resp, e = l.Provider.Complete(c, req)
 			return e
 		})
 		if err != nil {
@@ -126,11 +159,31 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 
 		text := contentText(resp.Message.Content)
 		truncated := resp.FinishReason == "length" || resp.FinishReason == "max_tokens"
-		l.Log.Append("assistant/message", map[string]any{
+		// Usage rides on the message event itself: one atomic append —
+		// a crash between the two can never lose usage a reply saved,
+		// and accounting costs zero extra events in the log.
+		ev := map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
 			"finish":     resp.FinishReason, "truncated": truncated,
-		})
+		}
+		if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+			ev["prompt_tokens"] = resp.Usage.InputTokens
+			ev["completion_tokens"] = resp.Usage.OutputTokens
+		}
+		l.Log.Append("assistant/message", ev)
+
+		// Crossing the cap aborts before tool side effects — this
+		// step's tool calls do not run. Same ordering as the guards.
+		if l.Guard.MaxSessionTokens > 0 {
+			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+				l.Log.Append("turn/end", map[string]any{
+					"reason": "aborted",
+					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
+				})
+				return Aborted, errors.New("agent: session token budget exceeded")
+			}
+		}
 
 		// Guard: repetition / no-progress / caps.
 		if abort, why := l.Guard.CheckStep(text, len(resp.Message.ToolCalls)); abort {
@@ -172,6 +225,50 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	}
 	l.Log.Append("turn/end", map[string]any{"reason": "aborted", "detail": "MaxSteps exceeded"})
 	return Aborted, errors.New("agent: step budget exhausted")
+}
+
+// shouldCompact fires when unfolded history exceeds the context scan
+// window — the sign that the next request would silently drop old
+// events rather than fold them.
+func (l *Loop) shouldCompact(msgs []llm.Message) bool {
+	window := int64(l.Budget.MaxEvents * 4)
+	return l.Log.Len()-l.Log.CompactedThrough() > window
+}
+
+func (l *Loop) compact() {
+	through := l.Log.Len() - int64(l.Budget.MaxEvents)
+	if err := session.Compact(l.Log, through); err != nil {
+		l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()})
+	}
+}
+
+// streamStep runs one model call through Streamer, logging throttled
+// assistant/delta events so the live feed shows progress without an
+// event per token (bounded log: deltas coalesce to ~4 KiB).
+func (l *Loop) streamStep(ctx context.Context, st llm.Streamer, req *llm.Request) (*llm.Response, error) {
+	var pending strings.Builder
+	flush := func() {
+		if pending.Len() == 0 {
+			return
+		}
+		l.Log.Append("assistant/delta", map[string]any{"text": pending.String()})
+		pending.Reset()
+	}
+	resp, err := st.Stream(ctx, req, func(d llm.Delta) error {
+		if d.Text != "" {
+			pending.WriteString(d.Text)
+			if pending.Len() >= 4096 {
+				flush()
+			}
+		}
+		if d.ToolName != "" {
+			flush()
+			l.Log.Append("assistant/tool-intent", map[string]any{"name": d.ToolName, "index": d.CallIndex})
+		}
+		return ctx.Err()
+	})
+	flush()
+	return resp, err
 }
 
 func contentText(c any) string {

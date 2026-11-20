@@ -182,3 +182,53 @@ func TestPostMessageBusyConflict(t *testing.T) {
 		t.Fatalf("post after turn end: %d", code)
 	}
 }
+
+// Events appended during replay must not be delivered twice: the live
+// channel and the log replay both see them.
+func TestStreamNoDuplicateAfterReplay(t *testing.T) {
+	ts, st := newTestServer(t)
+	defer ts.Close()
+	ses, err := st.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		ses.Log.Append("user/message", map[string]any{"role": "user", "content": fmt.Sprintf("m%d", i)})
+	}
+
+	req, _ := http.NewRequest("GET", ts.URL+"/v1/sessions/"+ses.ID+"/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Append more while the replay is in flight; each seq must appear once.
+	for i := 10; i < 14; i++ {
+		ses.Log.Append("user/message", map[string]any{"role": "user", "content": fmt.Sprintf("m%d", i)})
+	}
+
+	seen := map[int64]int{}
+	sc := bufio.NewScanner(resp.Body)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(seen) < 14 {
+		if !sc.Scan() {
+			break
+		}
+		line := sc.Text()
+		if !strings.HasPrefix(line, "id: ") {
+			continue
+		}
+		var n int64
+		fmt.Sscanf(line, "id: %d", &n)
+		seen[n]++
+	}
+	for seq, c := range seen {
+		if c != 1 {
+			t.Fatalf("seq %d delivered %d times", seq, c)
+		}
+	}
+	if len(seen) != 14 {
+		t.Fatalf("saw %d events, want 14", len(seen))
+	}
+}
