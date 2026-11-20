@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -331,6 +332,17 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// ?types=a,b filters server-side so a client rendering a long
+	// session doesn't pay for event kinds it will drop anyway.
+	var types map[string]bool
+	if v := r.URL.Query().Get("types"); v != "" {
+		types = map[string]bool{}
+		for _, t := range strings.Split(v, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				types[t] = true
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -373,7 +385,13 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		if ses.Log.Len() <= last {
 			return true
 		}
-		if err := ses.Log.ReadFrom(last, send); err != nil {
+		if err := ses.Log.ReadFrom(last, func(ev session.Event) bool {
+			if types != nil && !types[ev.Type] {
+				last = ev.Seq // skipped type still advances the cursor
+				return true
+			}
+			return send(ev)
+		}); err != nil {
 			return false
 		}
 		return !sendFailed
@@ -384,11 +402,14 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	//    snapshot-bounded, so catch up again for events appended (and
 	//    possibly dropped from the channel buffer) mid-replay; repeat
 	//    until a pass makes no progress.
-	sentOK := true
-	for sentOK {
+	for !sendFailed {
 		prev := last
-		replayErr := ses.Log.ReadFrom(last, send)
-		if replayErr != nil || sendFailed {
+		if err := ses.Log.ReadFrom(last, func(ev session.Event) bool {
+			if types != nil && !types[ev.Type] {
+				return true
+			}
+			return send(ev)
+		}); err != nil || sendFailed {
 			return
 		}
 		if last <= prev {
@@ -417,8 +438,12 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 			if ev.Seq > last+1 && !fill() {
 				return
 			}
-			if !send(ev) {
-				return
+			if types == nil || types[ev.Type] {
+				if !send(ev) {
+					return
+				}
+			} else if ev.Seq > last {
+				last = ev.Seq // skipped type still advances the cursor
 			}
 		case <-heartbeat.C:
 			// Tail events can be dropped with nothing newer to trigger
