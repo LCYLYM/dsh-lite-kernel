@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -27,17 +28,30 @@ type Session struct {
 // decided under the same lock that lists sessions, so a pending list
 // can't mint orphans.
 type Store struct {
-	mu   sync.Mutex
-	dir  string
-	live map[string]*Session
-	seq  int64
+	mu    sync.Mutex
+	dir   string
+	live  map[string]*Session
+	seq   int64
+	lockf *os.File
 }
 
+// NewStore takes an exclusive advisory lock on the dir: two processes
+// sharing a store would interleave jsonl appends into corrupted lines
+// (the daemon-vs-CLI race upstream never guarded). LOCK_NB so a second
+// opener fails loud instead of silently queueing.
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir, live: map[string]*Session{}}, nil
+	lf, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lf.Close()
+		return nil, fmt.Errorf("session: store %s already in use: %w", dir, err)
+	}
+	return &Store{dir: dir, live: map[string]*Session{}, lockf: lf}, nil
 }
 
 // Create opens a fresh session.
@@ -118,16 +132,23 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
-// Close flushes and closes every live session log; call it on
-// shutdown so no buffered write is lost. The store stays usable for
-// List but Get recreates sessions lazily afterward.
-func (s *Store) Close() {
+// Close flushes and closes every live session log, then releases the
+// store lock; call it on shutdown so no buffered write is lost. The
+// store stays usable for List but Get recreates sessions lazily.
+func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, ses := range s.live {
 		ses.Log.Close()
 		delete(s.live, id)
 	}
+	if s.lockf == nil {
+		return nil
+	}
+	err := syscall.Flock(int(s.lockf.Fd()), syscall.LOCK_UN)
+	cerr := s.lockf.Close()
+	s.lockf = nil
+	return errors.Join(err, cerr)
 }
 
 // List returns live session ids (a lock-held snapshot, never a stale copy).
