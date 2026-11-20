@@ -103,6 +103,10 @@ func (s *Store) CreateOrReuseBlank(workspace string) (*Session, bool, error) {
 	return ses, false, err
 }
 
+// ErrNotFound marks a missing (or malformed) session id. Handlers map
+// it to 404; every other store error stays a 500.
+var ErrNotFound = errors.New("session: no such session")
+
 // Get returns a live session or loads it from disk.
 func (s *Store) Get(id string) (*Session, error) {
 	s.mu.Lock()
@@ -111,11 +115,11 @@ func (s *Store) Get(id string) (*Session, error) {
 		return ses, nil
 	}
 	if !validID.MatchString(id) {
-		return nil, fmt.Errorf("session: invalid session id %q", id)
+		return nil, fmt.Errorf("%w %q", ErrNotFound, id)
 	}
 	path := filepath.Join(s.dir, id+".jsonl")
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("session: no such session %q", id)
+		return nil, fmt.Errorf("%w %q", ErrNotFound, id)
 	}
 	lg, err := OpenLog(path)
 	if err != nil {
@@ -130,6 +134,22 @@ func (s *Store) Get(id string) (*Session, error) {
 	}
 	s.live[id] = ses
 	return ses, nil
+}
+
+// Release evicts a session from the live map and closes its log. The
+// session reloads on the next Get — live memory should track working
+// sessions, not every session ever touched.
+func (s *Store) Release(id string) error {
+	s.mu.Lock()
+	ses, ok := s.live[id]
+	if ok {
+		delete(s.live, id)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return ses.Log.Close()
 }
 
 // Close flushes and closes every live session log, then releases the

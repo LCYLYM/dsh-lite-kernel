@@ -122,6 +122,21 @@ func TestStreamResumeFromSeq(t *testing.T) {
 	}
 }
 
+func TestGetMissingSession404(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+	for _, path := range []string{"/v1/sessions/nope", "/v1/sessions/..%2F..%2Fetc%2Fpasswd"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: %d, want 404", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestStreamGapFillAfterBufferOverflow(t *testing.T) {
 	st, err := session.NewStore(t.TempDir())
 	if err != nil {
