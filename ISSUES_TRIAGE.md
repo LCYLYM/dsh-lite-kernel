@@ -62,3 +62,19 @@ plugins rather than being baked in.
 - #13632 "vulnerable codes i dont know if its right or not but it maded by ai" — no repro
 - #13741 发错了 (posted by mistake), #13704 "bug", #13636 LiveShare deployment question, #13641 question about source-checkout updates, #13713 transient transport error report
 - Plugin showcase posts — community content, not defects
+
+## Hardening landed after the first pass (PR #25–#32)
+
+Follow-up review rounds plus a second audit of the kernel turned up
+further defects fixed in their own PRs:
+
+| PR | Defect | Fix |
+|----|--------|-----|
+| #25 | `POST /v1/sessions` ignored decode errors (malformed JSON silently minted a blank session) and no endpoint bounded request bodies | `decodeJSON` wraps every body in a 1 MiB `MaxBytesReader`; bad input is a 400 |
+| #26 | MCP responses pulled from a shared queue — a slow sibling call consumed another call's reply; writes interleaved; `CommandContext` killed the child when the init deadline's cancel ran | Replies demultiplexed by id through a `pending` map; writes serialized; the child is spawn-bound, not init-ctx-bound |
+| #27 | A `tool/result` whose `assistant` call was evicted by the context budget reached the model as an orphan (strict providers 400) | `BuildContext` drops results whose `tool_call_id` isn't in the kept window |
+| #28 | Provider error codes matched case-sensitively — `RateLimitExceeded` degraded to non-retryable `KindInvalid` | Codes folded once before classification |
+| #29 | `read_file` allocated the whole file before enforcing its 1 MiB cap; a fifo blocked `os.Open` forever | `Stat` first: non-regular rejected, size checked from metadata, read capped by `LimitReader` |
+| #30 | `Workspace`/`CreatedAt` lived in memory only — reloads lost them; the id counter restarted at 0 and reused `session-1-1`, appending into the old log | `session/meta` event carries the binding; the seq is seeded from disk and the id is `session-<seq>` |
+| #31 | Events appended mid-replay were delivered twice on the SSE stream (log replay + live channel) | `lastSeq` dedupes across the replay/live seam |
+| #32 | `Tail(0)` returned the last event; `Append` ignored its seek error; EOF detected by string compare | Edge cases corrected |
