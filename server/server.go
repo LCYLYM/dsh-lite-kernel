@@ -324,12 +324,20 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Replay from the durable log — this is what makes the stream
-	//    resumable instead of permanently dead (#13747). The live
-	//    subscription was taken first, so an event appended mid-replay
-	//    lands in BOTH places; send each seq once.
-	replayErr := ses.Log.ReadFrom(after, send)
-	if replayErr != nil || sendFailed {
-		return
+	//    resumable instead of permanently dead (#13747). The replay is
+	//    snapshot-bounded, so catch up again for events appended (and
+	//    possibly dropped from the channel buffer) mid-replay; repeat
+	//    until a pass makes no progress.
+	sentOK := true
+	for sentOK {
+		prev := last
+		replayErr := ses.Log.ReadFrom(last, send)
+		if replayErr != nil || sendFailed {
+			return
+		}
+		if last <= prev {
+			break // nothing sent — the log has not moved past the cursor
+		}
 	}
 
 	// 2. Live tail + heartbeat.

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
 )
@@ -110,6 +111,58 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	msgs, _ := BuildContext(lg, ContextBudget{MaxBytes: 1 << 20, MaxEvents: 100})
 	if len(msgs) != 2 {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
+	}
+}
+
+// A slow replay must not stall appends — ReadFrom reads through a
+// private descriptor, so writers never queue behind a client scan.
+// Holding l.mu across the replay would deadlock this test.
+func TestReplayDoesNotBlockAppends(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(filepath.Join(dir, "s.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		lg.Append("user/message", map[string]any{"role": "user", "content": i})
+	}
+	started := make(chan struct{})
+	appended := make(chan struct{})
+	go func() {
+		<-started
+		for i := 0; i < 500; i++ {
+			lg.Append("user/message", map[string]any{"role": "user", "content": "x"})
+		}
+		close(appended)
+	}()
+	first := true
+	err = lg.ReadFrom(0, func(ev Event) bool {
+		if first {
+			first = false
+			close(started)
+			select {
+			case <-appended:
+			case <-time.After(10 * time.Second):
+				t.Error("appends stalled behind the replay")
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTailZeroReturnsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(filepath.Join(dir, "s.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Append("user/message", map[string]any{"role": "user", "content": "x"})
+	if evs, err := lg.Tail(0); err != nil || len(evs) != 0 {
+		t.Fatalf("Tail(0) = %v, %v", evs, err)
 	}
 }
 
