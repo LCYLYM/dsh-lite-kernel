@@ -102,3 +102,9 @@ Third triage pass — already benign or by-design in the lite kernel:
 - [#13799](https://github.com/deepseek-ai/deepseek-harness/discussions/13799) sandboxed tool reads parent env → the file tools carry no environment; the sandboxed `shell` tool (PR #4) launches with a scrubbed env.
 - [#13759](https://github.com/deepseek-ai/deepseek-harness/discussions/13759) dead WS peers never reaped → transport is SSE with a per-request context; a dead client is just a closed response writer.
 - [#13767](https://github.com/deepseek-ai/deepseek-harness/discussions/13767), [#13768](https://github.com/deepseek-ai/deepseek-harness/discussions/13768) checkpoints vs full replay, async consistency → the lite answer is append-only + bounded tail-scan; reopening replays the log, not a checkpoint fork.
+
+| #41 | Replay and `Tail` held `l.mu` while reading the log — a slow SSE catch-up on a big log blocked every `Append` from the running turn | Readers snapshot offsets/size under the lock, then read via a private fd + `LimitReader` outside it |
+| #42 | No session fork; a copy built by replaying events would be O(history) and could collide on reused ids | `Fork` stream-copies the file (constant memory); `create` never reuses an id that exists on disk; a failed fork cleans up |
+| #43 | Rendering a long session required streaming the whole log; no way to remove a session | `GET /v1/sessions/{id}/tail` (O(n) lazy tail), `DELETE /v1/sessions/{id}` (idempotent) |
+| #44 | `write_file` shared one `.tmp` name (concurrent writes clobbered each other) and never fsynced | `writeAtomic`: unique temp + fsync + rename + dir fsync, matching `Log.Append` durability |
+| #45 | Hosts had no way to flush all open sessions on shutdown | `Store.Close` closes every live log; `Get` lazily reopens afterwards |
