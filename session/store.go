@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -47,6 +48,12 @@ func (s *Store) create(workspace string) (*Session, error) {
 	path := filepath.Join(s.dir, id+".jsonl")
 	lg, err := OpenLog(path)
 	if err != nil {
+		return nil, err
+	}
+	// Workspace is durable: it rides in the log so a session reloaded
+	// from disk (after restart or eviction) keeps its binding. Not
+	// model-visible — BuildContext skips event types it does not know.
+	if _, err := lg.Append("session/meta", map[string]any{"workspace": workspace}); err != nil {
 		return nil, err
 	}
 	ses := &Session{ID: id, Workspace: workspace, Log: lg}
@@ -96,7 +103,20 @@ func (s *Store) Get(id string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	ses := &Session{ID: id, Log: lg}
+	var ws string
+	_ = lg.ReadFrom(0, func(ev Event) bool {
+		if ev.Type != "session/meta" {
+			return true
+		}
+		var m struct {
+			Workspace string `json:"workspace"`
+		}
+		if json.Unmarshal(ev.Data, &m) == nil {
+			ws = m.Workspace
+		}
+		return false
+	})
+	ses := &Session{ID: id, Workspace: ws, Log: lg}
 	s.live[id] = ses
 	return ses, nil
 }

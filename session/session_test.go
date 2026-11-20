@@ -109,3 +109,22 @@ func TestRetryMarkerSkipped(t *testing.T) {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
 	}
 }
+
+// A session reloaded from disk keeps its workspace binding — the meta
+// event rides in the log, not in process memory.
+func TestWorkspaceSurvivesReload(t *testing.T) {
+	dir := t.TempDir()
+	st1, _ := NewStore(filepath.Join(dir, "data"))
+	ses, err := st1.Create("/srv/ws-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2, _ := NewStore(filepath.Join(dir, "data"))
+	got, err := st2.Get(ses.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Workspace != "/srv/ws-a" {
+		t.Fatalf("workspace lost on reload: %q", got.Workspace)
+	}
+}
