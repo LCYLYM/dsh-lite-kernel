@@ -48,6 +48,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}", s.getSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", s.postMessage)
 	mux.HandleFunc("GET /v1/sessions/{id}/events", s.streamEvents)
+	mux.HandleFunc("GET /v1/sessions/{id}/history", s.history)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
 	if s.Token != "" {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +91,50 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		"created_at": ses.CreatedAt,
 		"events":     ses.Log.Len(),
 	})
+}
+
+// history pages events without SSE: ?after=<seq>&limit=<n> (default
+// 200, cap 500). Each page reads only its slice via the offset index.
+func (s *Server) history(w http.ResponseWriter, r *http.Request) {
+	ses, err := s.Store.Get(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var after int64
+	limit := 200
+	if v := r.URL.Query().Get("after"); v != "" {
+		parsed, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil || parsed < 0 {
+			http.Error(w, "after must be a non-negative seq", http.StatusBadRequest)
+			return
+		}
+		after = parsed
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		parsed, perr := strconv.Atoi(v)
+		if perr != nil || parsed <= 0 || parsed > 500 {
+			http.Error(w, "limit must be 1-500", http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	var evs []session.Event
+	if err := ses.Log.ReadFrom(after, func(ev session.Event) bool {
+		if len(evs) >= limit {
+			return false
+		}
+		evs = append(evs, ev)
+		return true
+	}); err != nil {
+		writeErr(w, err)
+		return
+	}
+	var next int64
+	if len(evs) == limit {
+		next = evs[len(evs)-1].Seq
+	}
+	writeJSON(w, map[string]any{"events": evs, "next": next})
 }
 
 // postMessage starts a turn in the background and returns immediately;
