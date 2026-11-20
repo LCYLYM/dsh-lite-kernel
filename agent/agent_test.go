@@ -169,16 +169,17 @@ func TestEmptyResponseIsRetried(t *testing.T) {
 	if state != Completed || err != nil {
 		t.Fatalf("state=%s err=%v", state, err)
 	}
-	// No empty assistant message may reach the log.
+	// No empty assistant message (no content and no tool calls) may reach the log.
 	var empty bool
 	_ = lg.ReadFrom(0, func(ev session.Event) bool {
 		if ev.Type != "assistant/message" {
 			return true
 		}
 		var m struct {
-			Content any `json:"content"`
+			Content   any             `json:"content"`
+			ToolCalls json.RawMessage `json:"tool_calls"`
 		}
-		if json.Unmarshal(ev.Data, &m) == nil && m.Content == nil {
+		if json.Unmarshal(ev.Data, &m) == nil && m.Content == nil && len(m.ToolCalls) == 0 {
 			empty = true
 		}
 		return true
