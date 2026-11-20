@@ -158,6 +158,12 @@ func (l *Log) Subscribe(buf int) (<-chan Event, func()) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	ch := make(chan Event, buf)
+	if l.closed {
+		// A closed log emits nothing: hand back a closed channel so a
+		// subscriber's range exits instead of waiting forever.
+		close(ch)
+		return ch, func() {}
+	}
 	l.subs[ch] = struct{}{}
 	return ch, func() {
 		l.mu.Lock()
