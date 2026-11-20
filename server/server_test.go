@@ -286,9 +286,18 @@ func TestPostMessageBusyConflict(t *testing.T) {
 		t.Fatalf("busy post: %d, want 409", code)
 	}
 	close(gate)
-	time.Sleep(100 * time.Millisecond)
-	if code := post(); code != 200 {
-		t.Fatalf("post after turn end: %d", code)
+	// Poll rather than sleep: the turn teardown is a goroutine
+	// handoff that can outlast any fixed delay on a loaded runner.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code := post()
+		if code == 200 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post after turn end: still %d after 5s", code)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 
