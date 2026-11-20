@@ -17,16 +17,51 @@ import (
 type Workspace struct{ Root string }
 
 func (w Workspace) resolve(p string) (string, error) {
-	clean := filepath.Clean(filepath.Join(w.Root, p))
-	abs, err := filepath.Abs(clean)
+	rootAbs, err := filepath.Abs(w.Root)
 	if err != nil {
 		return "", err
 	}
-	rootAbs, _ := filepath.Abs(w.Root)
-	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(os.PathSeparator)) {
+	abs, err := filepath.Abs(filepath.Clean(filepath.Join(w.Root, p)))
+	if err != nil {
+		return "", err
+	}
+	rootReal, err := realPath(rootAbs)
+	if err != nil {
+		return "", err
+	}
+	abs, err = realPath(abs)
+	if err != nil {
+		return "", err
+	}
+	if abs != rootReal && !strings.HasPrefix(abs, rootReal+string(os.PathSeparator)) {
 		return "", fmt.Errorf("tools: path %q escapes the workspace", p)
 	}
 	return abs, nil
+}
+
+// realPath resolves symlinks along p. EvalSymlinks fails on paths that
+// don't exist yet (a new file or a not-yet-created workspace), so walk
+// to the deepest existing ancestor, resolve it, and rejoin the tail.
+func realPath(p string) (string, error) {
+	var tail []string
+	for {
+		if _, err := os.Lstat(p); err == nil {
+			real, rerr := filepath.EvalSymlinks(p)
+			if rerr != nil {
+				return "", rerr
+			}
+			for i := len(tail) - 1; i >= 0; i-- {
+				real = filepath.Join(real, tail[i])
+			}
+			return real, nil
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return "", fmt.Errorf("tools: cannot resolve %q", p)
+		}
+		tail = append(tail, filepath.Base(p))
+		p = parent
+	}
 }
 
 // ReadFile reads a file inside the workspace.

@@ -68,11 +68,48 @@ type Provider interface {
 
 // openaiRequest is the wire shape for OpenAI-compatible endpoints.
 type openaiRequest struct {
-	Model       string     `json:"model"`
-	Messages    []Message  `json:"messages"`
-	Tools       []toolSpec `json:"tools,omitempty"`
-	MaxTokens   int        `json:"max_tokens,omitempty"`
-	Temperature *float64   `json:"temperature,omitempty"`
+	Model       string        `json:"model"`
+	Messages    []wireMessage `json:"messages"`
+	Tools       []toolSpec    `json:"tools,omitempty"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	Stream      bool          `json:"stream,omitempty"`
+}
+
+// wireMessage is the outgoing message shape: the API requires tool
+// calls as nested `function` objects with arguments as a JSON *string*,
+// not the kernel's flat ToolCall form.
+type wireMessage struct {
+	Role       string         `json:"role"`
+	Content    any            `json:"content,omitempty"`
+	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+type wireToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+func wireMessages(msgs []Message) []wireMessage {
+	out := make([]wireMessage, 0, len(msgs))
+	for _, m := range msgs {
+		wm := wireMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		for _, tc := range m.ToolCalls {
+			var w wireToolCall
+			w.ID = tc.ID
+			w.Type = "function"
+			w.Function.Name = tc.Name
+			w.Function.Arguments = string(tc.Args)
+			wm.ToolCalls = append(wm.ToolCalls, w)
+		}
+		out = append(out, wm)
+	}
+	return out
 }
 
 type toolSpec struct {
@@ -111,7 +148,7 @@ type OpenAIProvider struct {
 }
 
 func (p *OpenAIProvider) Complete(ctx context.Context, req *Request) (*Response, error) {
-	or := openaiRequest{Model: req.Model, Messages: req.Messages, MaxTokens: req.MaxTokens, Temperature: req.Temperature}
+	or := openaiRequest{Model: req.Model, Messages: wireMessages(req.Messages), MaxTokens: req.MaxTokens, Temperature: req.Temperature}
 	for _, t := range req.Tools {
 		var ts toolSpec
 		ts.Type = "function"
