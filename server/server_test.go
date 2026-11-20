@@ -138,6 +138,23 @@ func TestRejectsBadAfterSeq(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
+	// Negative seqs clamped to a full replay — same silent-mistake
+	// class as a non-numeric value (history?after= already 400s them).
+	for _, bad := range []string{"after_seq=-1", ""} {
+		u := ts.URL + "/v1/sessions/" + ses.ID + "/events?" + bad
+		req, _ := http.NewRequest("GET", u, nil)
+		if bad == "" {
+			req.Header.Set("Last-Event-ID", "-3")
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		if r.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: status %d", bad, r.StatusCode)
+		}
+	}
 }
 
 func TestRejectsMalformedAndOversizedBodies(t *testing.T) {
