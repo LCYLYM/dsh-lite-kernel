@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -136,6 +137,17 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
 		after, _ = strconv.ParseInt(v, 10, 64)
 	}
+	// ?types=a,b filters server-side so a client rendering a long
+	// session doesn't pay for event kinds it will drop anyway.
+	var types map[string]bool
+	if v := r.URL.Query().Get("types"); v != "" {
+		types = map[string]bool{}
+		for _, t := range strings.Split(v, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				types[t] = true
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -165,6 +177,9 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	// 1. Replay from the durable log — this is what makes the stream
 	//    resumable instead of permanently dead (#13747).
 	replayErr := ses.Log.ReadFrom(after, func(ev session.Event) bool {
+		if types != nil && !types[ev.Type] {
+			return true
+		}
 		return send(ev)
 	})
 	if replayErr != nil {
@@ -179,8 +194,13 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case ev, ok := <-ch:
-			if !ok || !send(ev) {
+			if !ok {
 				return
+			}
+			if types == nil || types[ev.Type] {
+				if !send(ev) {
+					return
+				}
 			}
 		case <-heartbeat.C:
 			_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
