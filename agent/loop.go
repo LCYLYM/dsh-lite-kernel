@@ -136,14 +136,30 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			Tools:    l.Registry.Specs(),
 		}
 		err = l.Retry.Do(ctx, func(c context.Context) error {
+			// A stalled provider call must not park the turn until the
+			// caller's outer deadline (#13621 frozen turns): bound each
+			// attempt, let Retry decide whether to take another.
+			if l.Guard.CallTimeout > 0 {
+				var cancel context.CancelFunc
+				c, cancel = context.WithTimeout(c, time.Duration(l.Guard.CallTimeout)*time.Second)
+				defer cancel()
+			}
 			var e error
 			if l.Stream {
 				if st, ok := l.Provider.(llm.Streamer); ok {
 					resp, e = l.streamStep(c, st, req)
-					return e
+				} else {
+					resp, e = l.Provider.Complete(c, req)
 				}
+			} else {
+				resp, e = l.Provider.Complete(c, req)
 			}
-			resp, e = l.Provider.Complete(c, req)
+			// A per-attempt deadline surfaced raw is a classified timeout
+			// — retryable, not an opaque turn failure.
+			if e != nil && c.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+				return &llm.CallError{Kind: llm.KindTimeout,
+					Message: fmt.Sprintf("provider call exceeded %ds", l.Guard.CallTimeout)}
+			}
 			return e
 		})
 		if err != nil {

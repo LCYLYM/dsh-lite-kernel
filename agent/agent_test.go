@@ -146,6 +146,30 @@ func TestMailboxDurableReplay(t *testing.T) {
 	}
 }
 
+// gateProvider blocks until the gate closes or ctx dies.
+type gateProvider struct{ gate chan struct{} }
+
+func (p *gateProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	select {
+	case <-p.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestCallTimeoutClassifiedRetryable(t *testing.T) {
+	gate := make(chan struct{})
+	loop, _ := newLoop(t, &gateProvider{gate: gate})
+	loop.Guard.CallTimeout = 1
+	loop.Retry = llm.Policy{Retries: 0}
+	defer close(gate)
+	state, err := loop.Run(context.Background(), "hi")
+	if state != Waiting || !strings.Contains(err.Error(), "exceeded 1s") {
+		t.Fatalf("state=%s err=%v — timeout should be a retryable waiting turn", state, err)
+	}
+}
+
 // slowProvider holds the first call until released.
 type slowProvider struct{ gate chan struct{} }
 
