@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -39,6 +40,46 @@ func (s *Store) Create(workspace string) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.create(workspace)
+}
+
+// Fork clones a session's durable log into a new id — cheap by design:
+// the copy is a stream (io.Copy), never a full parse, so forking a
+// 50 MB history costs one sequential read instead of the upstream's
+// load-everything fork stall.
+func (s *Store) Fork(id string) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src := filepath.Join(s.dir, id+".jsonl")
+	if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("session: no such session %q", id)
+	}
+	var ws string
+	if old, ok := s.live[id]; ok {
+		ws = old.Workspace
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return nil, err
+	}
+	defer in.Close()
+
+	ses, err := s.create(ws)
+	if err != nil {
+		return nil, err
+	}
+	out, err := os.OpenFile(ses.Log.path, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return nil, err
+	}
+	out.Close()
+	if err := ses.Log.reindex(); err != nil {
+		return nil, err
+	}
+	return ses, nil
 }
 
 func (s *Store) create(workspace string) (*Session, error) {

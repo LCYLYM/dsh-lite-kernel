@@ -60,6 +60,31 @@ func OpenLog(path string) (*Log, error) {
 	return l, nil
 }
 
+// reindex rescans the file after an out-of-band rewrite (Store.Fork
+// copies bytes behind the handle's back).
+func (l *Log) reindex() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, err := l.f.Seek(0, 0); err != nil {
+		return err
+	}
+	l.offsets = l.offsets[:0]
+	l.nextSeq = 1
+	sc := bufio.NewScanner(l.f)
+	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	var off int64
+	for sc.Scan() {
+		l.offsets = append(l.offsets, off)
+		off += int64(len(sc.Bytes())) + 1
+		l.nextSeq++
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("session: corrupt log %s: %w", l.path, err)
+	}
+	_, err := l.f.Seek(0, 2)
+	return err
+}
+
 // Len returns the number of events.
 func (l *Log) Len() int64 { return l.nextSeq - 1 }
 

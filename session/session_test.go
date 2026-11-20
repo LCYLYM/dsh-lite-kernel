@@ -109,3 +109,29 @@ func TestRetryMarkerSkipped(t *testing.T) {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
 	}
 }
+
+func TestForkClonesLog(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := NewStore(dir)
+	src, err := st.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src.Log.Append("user/message", map[string]any{"role": "user", "content": "hello"})
+
+	fork, err := st.Fork(src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fork.ID == src.ID {
+		t.Fatal("fork reused the source id")
+	}
+	if fork.Log.Len() != 1 {
+		t.Fatalf("fork has %d events", fork.Log.Len())
+	}
+	// Appends to the fork must not touch the source log.
+	fork.Log.Append("user/message", map[string]any{"role": "user", "content": "branch"})
+	if src.Log.Len() != 1 {
+		t.Fatal("fork write leaked into the source log")
+	}
+}
