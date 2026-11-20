@@ -167,7 +167,10 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	// tools that need a writable home (gocache, config) get /tmp. The
 	// daemon's credential-shaped variables never enter a model command —
 	// a logged `env` must not leak DEEPSEEK_API_KEY / DSHK_TOKEN.
-	cmd.Env = envWith(envScrubbed(), map[string]string{"HOME": "/tmp", "TMPDIR": "/tmp"})
+	// A command without network has no use for proxy/mirror
+	// credentials — scrub them too.
+	net := !sandboxed() || s.AllowNet
+	cmd.Env = envWith(envScrubbed(net), map[string]string{"HOME": "/tmp", "TMPDIR": "/tmp"})
 
 	max := s.MaxOutput
 	if max <= 0 {
@@ -206,15 +209,16 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 // GIT_AUTHOR_*/GIT_COMMITTER_*/GIT_CONFIG_* are the shell git's own
 // settings (stripping them breaks commits, and dropping the keys while
 // GIT_CONFIG_COUNT survives corrupts env-based config), and GOPROXY
-// selects the module mirror builds fetch through. Any other GIT_*
-// name — GIT_TOKEN and friends — stays scrub-checked.
-func envScrubbed() []string {
+// selects the module mirror builds fetch through — but only when the
+// command can reach the network at all. Any other GIT_* name —
+// GIT_TOKEN and friends — stays scrub-checked.
+func envScrubbed(net bool) []string {
 	var out []string
 	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
+		name, val, _ := strings.Cut(kv, "=")
 		u := strings.ToUpper(name)
 		sensitive := false
-		if !benignShellConfig(u) {
+		if !benignShellConfig(u, val, net) {
 			for _, pat := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "PROXY"} {
 				if strings.Contains(u, pat) {
 					sensitive = true
@@ -229,13 +233,28 @@ func envScrubbed() []string {
 	return out
 }
 
-func benignShellConfig(u string) bool {
+func benignShellConfig(u, val string, net bool) bool {
 	for _, p := range []string{"GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"} {
 		if strings.HasPrefix(u, p) {
 			return true
 		}
 	}
-	return u == "GOPROXY"
+	if !net {
+		// GOPROXY is a comma/pipe-separated list; keep it only
+		// when every entry is offline-safe — a local file mirror
+		// or a keyword — so a credentialed remote entry can never
+		// ride along behind a benign first entry.
+		return u == "GOPROXY" && offlineSafeProxyList(val)
+	}
+	// Go module config selects mirrors and private-module rules;
+	// dropping GONOPROXY/GOPRIVATE while keeping GOPROXY sends
+	// private dependencies to the mirror and breaks the build.
+	for _, p := range []string{"GOPROXY", "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOFLAGS", "GOWORK"} {
+		if u == p {
+			return true
+		}
+	}
+	return false
 }
 
 func envWith(base []string, set map[string]string) []string {
@@ -281,3 +300,25 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 func (b *limitedBuffer) String() string { return b.buf.String() }
+
+// offlineSafeProxyList reports whether every GOPROXY entry works
+// without the network and cannot carry credentials: file:// mirrors
+// (no userinfo) and the off/direct keywords.
+func offlineSafeProxyList(v string) bool {
+	for _, e := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == '|' }) {
+		e = strings.TrimSpace(e)
+		if e == "off" || e == "direct" {
+			continue
+		}
+		if !strings.HasPrefix(e, "file://") {
+			return false
+		}
+		// Only the authority segment can carry userinfo; an '@' in
+		// the path (a directory literally named "x@y") is legal.
+		authority, _, _ := strings.Cut(strings.TrimPrefix(e, "file://"), "/")
+		if strings.Contains(authority, "@") {
+			return false
+		}
+	}
+	return v != ""
+}

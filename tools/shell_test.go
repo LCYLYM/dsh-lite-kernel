@@ -145,6 +145,7 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 	t.Setenv("GIT_AUTHOR_NAME", "kernel-bot")
 	t.Setenv("GIT_TOKEN", "leak-me-three")
 	t.Setenv("GOPROXY", "https://user:pass@goproxy.corp")
+	t.Setenv("GONOPROXY", "corp.example.com")
 	res := shellCall(t, "env")
 	out := res["output"].(string)
 	for _, name := range []string{"DSHK_TEST_TOKEN_X", "DSHK_TEST_APIKEY", "DSHK_TEST_HTTPS_PROXY", "GIT_TOKEN"} {
@@ -158,8 +159,53 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 	if !strings.Contains(out, "GIT_AUTHOR_NAME=kernel-bot") {
 		t.Fatal("env scrub stripped git's own config namespace")
 	}
+	// GOPROXY is kept only for commands that can reach the network:
+	// unsandboxed (host net) or AllowNet. In the default no-net sandbox
+	// it is scrubbed like any other credential-bearing proxy var.
+	net := !sandboxed()
+	if !net {
+		if strings.Contains(out, "GOPROXY=") {
+			t.Fatal("no-net sandbox kept GOPROXY credentials")
+		}
+		// A local file mirror still works without the network —
+		// it must survive the scrub.
+		t.Setenv("GOPROXY", "file:///root/gomodcache")
+		s0 := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second}
+		args0, _ := json.Marshal(map[string]string{"cmd": "env"})
+		raw0, err := s0.Call(context.Background(), args0)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if !strings.Contains(raw0.(map[string]any)["output"].(string), "GOPROXY=file://") {
+			t.Fatal("no-net sandbox dropped a local file:// GOPROXY")
+		}
+		// A remote credentialed entry behind a benign first entry
+		// must scrub the whole list.
+		t.Setenv("GOPROXY", "file:///root/m,https://user:pass@goproxy.corp")
+		s1 := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second}
+		args1, _ := json.Marshal(map[string]string{"cmd": "env"})
+		raw1, err := s1.Call(context.Background(), args1)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if strings.Contains(raw1.(map[string]any)["output"].(string), "GOPROXY=") {
+			t.Fatal("no-net sandbox kept a mixed GOPROXY list with credentials")
+		}
+		t.Setenv("GOPROXY", "https://user:pass@goproxy.corp")
+		t.Setenv("DSHK_TEST_TOKEN_X", "leak-me")
+		s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second, AllowNet: true}
+		args, _ := json.Marshal(map[string]string{"cmd": "env"})
+		raw, err := s.Call(context.Background(), args)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		out = raw.(map[string]any)["output"].(string)
+	}
 	if !strings.Contains(out, "GOPROXY=https://user:pass@goproxy.corp") {
-		t.Fatal("env scrub dropped GOPROXY — builds cannot fetch modules")
+		t.Fatal("env scrub dropped GOPROXY from a networked command")
+	}
+	if !strings.Contains(out, "GONOPROXY=") {
+		t.Fatal("env scrub dropped GONOPROXY — private deps hit the mirror")
 	}
 }
 
