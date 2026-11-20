@@ -1,6 +1,7 @@
 package session
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -107,5 +108,42 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	msgs, _ := BuildContext(lg, ContextBudget{MaxBytes: 1 << 20, MaxEvents: 100})
 	if len(msgs) != 2 {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
+	}
+}
+
+func TestReadFromSurfacesCorruption(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(filepath.Join(dir, "x.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Append("user/message", map[string]any{"role": "user", "content": "a"})
+	lg.Close()
+	// corrupt a line in the middle, keep a valid tail
+	f, _ := os.ReadFile(filepath.Join(dir, "x.jsonl"))
+	lines := strings.SplitN(string(f), "\n", 2)
+	f2, _ := os.Create(filepath.Join(dir, "x.jsonl"))
+	f2.WriteString("not-json\n" + lines[1])
+	f2.Close()
+	lg2, err := OpenLog(filepath.Join(dir, "x.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg2.Close()
+	if err := lg2.ReadFrom(0, func(Event) bool { return true }); err == nil ||
+		!strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("mid-log corruption not surfaced: %v", err)
+	}
+	// a partial last line (crash mid-append) is tolerated
+	os.WriteFile(filepath.Join(dir, "y.jsonl"), []byte(`{"seq":1,"type":"user/message","data":{},"ts":1}
+{"seq":2,"typ`), 0o600)
+	lg3, err := OpenLog(filepath.Join(dir, "y.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg3.Close()
+	n := 0
+	if err := lg3.ReadFrom(0, func(Event) bool { n++; return true }); err != nil || n != 1 {
+		t.Fatalf("partial tail should be tolerated: %v n=%d", err, n)
 	}
 }
