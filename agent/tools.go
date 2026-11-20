@@ -39,12 +39,23 @@ func (r *Registry) Register(t Tool) (kernel.Disposable, error) {
 // through untouched (union types survive, #13630).
 func (r *Registry) Specs() []llm.ToolSpec {
 	var out []llm.ToolSpec
+	// First-found wins, same as Lookup: a child-scope tool shadows an
+	// ancestor's, so only the shadowing spec may reach the model —
+	// advertising both is a duplicate-name request some providers
+	// reject outright.
+	seen := map[string]bool{}
 	for sc := r.scope; sc != nil; sc = sc.Parent() {
 		for name, svc := range sc.Services() {
-			if len(name) > 5 && name[:5] == "tool/" {
-				if t, ok := svc.(Tool); ok {
-					out = append(out, llm.ToolSpec{Name: t.Name(), Description: t.Description(), Schema: t.Schema()})
-				}
+			if len(name) <= 5 || name[:5] != "tool/" {
+				continue
+			}
+			short := name[5:]
+			if seen[short] {
+				continue
+			}
+			seen[short] = true
+			if t, ok := svc.(Tool); ok {
+				out = append(out, llm.ToolSpec{Name: t.Name(), Description: t.Description(), Schema: t.Schema()})
 			}
 		}
 	}
@@ -59,7 +70,10 @@ func (r *Registry) Call(ctx context.Context, tc llm.ToolCall) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("agent: tool %q is not registered in this scope", tc.Name)
 	}
-	t := svc.(Tool)
+	t, ok := svc.(Tool)
+	if !ok {
+		return nil, fmt.Errorf("agent: %q is registered under the tool/ namespace but is not a Tool", tc.Name)
+	}
 	to := r.timeout
 	if to <= 0 {
 		to = 60 * time.Second

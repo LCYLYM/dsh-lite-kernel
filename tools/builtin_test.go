@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -21,6 +22,58 @@ func TestWorkspaceEscapeRejected(t *testing.T) {
 	}
 }
 
+// A symlink inside the workspace pointing outside is an escape route;
+// resolve must follow links, not just check path text.
+func TestSymlinkEscapeRejected(t *testing.T) {
+	dir := t.TempDir()
+	out := t.TempDir()
+	secret := filepath.Join(out, "secret.txt")
+	os.WriteFile(secret, []byte("s3cret"), 0o600)
+	if err := os.Symlink(out, filepath.Join(dir, "link")); err != nil {
+		t.Skip("symlinks unsupported")
+	}
+	w := Workspace{Root: dir}
+	rf := ReadFile{W: w}
+	args, _ := json.Marshal(map[string]string{"path": "link/secret.txt"})
+	if _, err := rf.Call(context.Background(), args); err == nil {
+		t.Fatal("symlink escape was not rejected")
+	}
+	wf := WriteFile{W: w}
+	args, _ = json.Marshal(map[string]string{"path": "link/new.txt", "content": "x"})
+	if _, err := wf.Call(context.Background(), args); err == nil {
+		t.Fatal("write through symlink was not rejected")
+	}
+	// A symlink pointing *inside* still works.
+	os.MkdirAll(filepath.Join(dir, "real"), 0o755)
+	os.WriteFile(filepath.Join(dir, "real", "f.txt"), []byte("ok"), 0o644)
+	os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "inlink"))
+	args, _ = json.Marshal(map[string]string{"path": "inlink/f.txt"})
+	if _, err := rf.Call(context.Background(), args); err != nil {
+		t.Fatalf("inside symlink rejected: %v", err)
+	}
+}
+
+// A relative workspace root (the CLI default ".") and a workspace that
+// does not exist yet must both resolve correctly.
+func TestRelativeAndMissingWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	old, _ := os.Getwd()
+	defer os.Chdir(old)
+	os.Chdir(dir)
+	w := Workspace{Root: "."}
+	wf := WriteFile{W: w}
+	args, _ := json.Marshal(map[string]string{"path": "f.txt", "content": "hi"})
+	if _, err := wf.Call(context.Background(), args); err != nil {
+		t.Fatalf("relative workspace rejected: %v", err)
+	}
+	w2 := Workspace{Root: filepath.Join(dir, "newws")}
+	wf2 := WriteFile{W: w2}
+	args, _ = json.Marshal(map[string]string{"path": "a/f.txt", "content": "hi"})
+	if _, err := wf2.Call(context.Background(), args); err != nil {
+		t.Fatalf("missing workspace rejected: %v", err)
+	}
+}
+
 func TestWriteThenRead(t *testing.T) {
 	dir := t.TempDir()
 	w := Workspace{Root: dir}
@@ -32,5 +85,36 @@ func TestWriteThenRead(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(dir, "a", "b.txt"))
 	if err != nil || string(b) != "hello" {
 		t.Fatalf("got %q err %v", b, err)
+	}
+}
+
+// An oversized file is rejected from its size metadata — the heap never
+// sees its contents.
+func TestReadFileOversize(t *testing.T) {
+	dir := t.TempDir()
+	big := filepath.Join(dir, "big.bin")
+	if err := os.WriteFile(big, make([]byte, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := (ReadFile{W: Workspace{Root: dir}}).Call(context.Background(),
+		json.RawMessage(`{"path":"big.bin"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := out.(map[string]any)
+	if !ok || m["error"] == nil {
+		t.Fatalf("expected cap error, got %v", out)
+	}
+}
+
+func TestReadFileRejectsFifo(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (ReadFile{W: Workspace{Root: dir}}).Call(context.Background(),
+		json.RawMessage(`{"path":"pipe"}`)); err == nil {
+		t.Fatal("expected non-regular file error")
 	}
 }

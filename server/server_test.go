@@ -2,6 +2,8 @@ package server
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -135,5 +137,207 @@ func TestRejectsBadAfterSeq(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestRejectsMalformedAndOversizedBodies(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/sessions", "application/json", strings.NewReader("{not json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed body: status %d", resp.StatusCode)
+	}
+
+	big := strings.NewReader(`{"workspace":"` + strings.Repeat("x", 2<<20) + `"}`)
+	resp, err = http.Post(ts.URL+"/v1/sessions", "application/json", big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized body: status %d", resp.StatusCode)
+	}
+}
+
+func TestGetMissingSession404(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+	for _, path := range []string{"/v1/sessions/nope", "/v1/sessions/..%2F..%2Fetc%2Fpasswd"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: %d, want 404", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestStreamGapFillAfterBufferOverflow(t *testing.T) {
+	st, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Store: st, EventBuf: 1, Heartbeat: 50 * time.Millisecond,
+		Provider: &llm.EchoProvider{}, Model: "echo",
+		NewLoop: func(ses *session.Session) *agent.Loop { return nil }}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	ses, err := st.Create("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET",
+		ts.URL+"/v1/sessions/"+ses.ID+"/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// let the handler subscribe before the burst
+	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < 300; i++ {
+		ses.Log.Append("assistant/message", map[string]any{"content": i})
+	}
+	// read until seq 300 arrives — buffer drops must be refilled
+	sc := bufio.NewScanner(resp.Body)
+	last := int64(0)
+	deadline := time.Now().Add(10 * time.Second)
+	for last < 300 && time.Now().Before(deadline) {
+		if !sc.Scan() {
+			t.Fatalf("stream ended early: %v", sc.Err())
+		}
+		line := sc.Text()
+		if strings.HasPrefix(line, "id: ") {
+			var n int64
+			fmt.Sscanf(line, "id: %d", &n)
+			if n != last+1 {
+				t.Fatalf("gap in delivered seqs: got %d after %d", n, last)
+			}
+			last = n
+		}
+	}
+	if last != 300 {
+		t.Fatalf("only %d/300 events delivered", last)
+	}
+}
+
+type holdProvider struct{ gate chan struct{} }
+
+func (p *holdProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	<-p.gate
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestPostMessageBusyConflict(t *testing.T) {
+	st, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	srv := &Server{
+		Store: st, Provider: &llm.EchoProvider{}, Model: "echo",
+		NewLoop: func(ses *session.Session) *agent.Loop {
+			root := kernel.NewRoot("root")
+			sc, _ := root.Child("a")
+			reg := agent.NewRegistry(sc, time.Second)
+			return &agent.Loop{
+				Model: "echo", Provider: &holdProvider{gate: gate}, Registry: reg, Log: ses.Log,
+				Budget: session.DefaultBudget(), Guard: agent.DefaultGuard(),
+				Retry: llm.Policy{Retries: 0},
+			}
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	res, err := http.Post(ts.URL+"/v1/sessions", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(res.Body).Decode(&created)
+	res.Body.Close()
+
+	post := func() int {
+		r, err := http.Post(ts.URL+"/v1/sessions/"+created.ID+"/messages",
+			"application/json", strings.NewReader(`{"text":"hi"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+	if code := post(); code != 200 {
+		t.Fatalf("first post: %d", code)
+	}
+	time.Sleep(100 * time.Millisecond) // let the turn reach Complete
+	if code := post(); code != http.StatusConflict {
+		t.Fatalf("busy post: %d, want 409", code)
+	}
+	close(gate)
+	time.Sleep(100 * time.Millisecond)
+	if code := post(); code != 200 {
+		t.Fatalf("post after turn end: %d", code)
+	}
+}
+
+// Events appended during replay must not be delivered twice: the live
+// channel and the log replay both see them.
+func TestStreamNoDuplicateAfterReplay(t *testing.T) {
+	ts, st := newTestServer(t)
+	defer ts.Close()
+	ses, err := st.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		ses.Log.Append("user/message", map[string]any{"role": "user", "content": fmt.Sprintf("m%d", i)})
+	}
+
+	req, _ := http.NewRequest("GET", ts.URL+"/v1/sessions/"+ses.ID+"/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Append more while the replay is in flight; each seq must appear once.
+	for i := 10; i < 14; i++ {
+		ses.Log.Append("user/message", map[string]any{"role": "user", "content": fmt.Sprintf("m%d", i)})
+	}
+
+	seen := map[int64]int{}
+	sc := bufio.NewScanner(resp.Body)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(seen) < 14 {
+		if !sc.Scan() {
+			break
+		}
+		line := sc.Text()
+		if !strings.HasPrefix(line, "id: ") {
+			continue
+		}
+		var n int64
+		fmt.Sscanf(line, "id: %d", &n)
+		seen[n]++
+	}
+	for seq, c := range seen {
+		if c != 1 {
+			t.Fatalf("seq %d delivered %d times", seq, c)
+		}
+	}
+	if len(seen) != 14 {
+		t.Fatalf("saw %d events, want 14", len(seen))
 	}
 }
