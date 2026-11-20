@@ -133,11 +133,16 @@ Third triage pass — already benign or by-design in the lite kernel:
 | #43 | Rendering a long session required streaming the whole log; no way to remove a session | `GET /v1/sessions/{id}/tail` (O(n) lazy tail), `DELETE /v1/sessions/{id}` (idempotent) |
 | #44 | `write_file` shared one `.tmp` name (concurrent writes clobbered each other) and never fsynced | `writeAtomic`: unique temp + fsync + rename + dir fsync, matching `Log.Append` durability |
 | #45 | Hosts had no way to flush all open sessions on shutdown | `Store.Close` closes every live log; `Get` lazily reopens afterwards |
+| #46 | `GET /sessions/{id}` exposed only the id | Returns workspace + `created_at` (durable `session/meta`) |
+| #47 | Clients paged history only through SSE | `GET /sessions/{id}/history?after=&limit=` — bounded paged reads |
+| #48 | Clients rendering one event kind paid for the whole stream | `?types=a,b` server-side SSE filter; filtered seqs still advance the cursor |
+| #50 | Merge cascade dropped the notice-wake machinery (Resume/settle/re-pend); stop-report notices re-triggered the model (#13859) | Restored all of it; `wake:false` enqueues without waking |
+| #51 | Same cascade dropped `BuildContext`'s widening loop — control events crowded rendered history out of the tail window | Widening restored + `MaxEvents<=0` early return |
 
 Fourth triage pass (#13852–#13870) — already benign or by-design in the lite kernel:
 
 - [#13862](https://github.com/deepseek-ai/deepseek-harness/discussions/13862) once messages exceed ~2× the model window, model-written compaction can never succeed → lite compaction is deterministic (drop-with-marker), needs no model call, and `BuildContext` is byte-bounded so the request can never outgrow the window.
-- [#13859](https://github.com/deepseek-ai/dsh/discussions/13859) aborted parent turn leaves child without a settle line; a stop notice wakes the idle parent and the model re-dispatches → no subagents exist; wake-on-notice only fires on explicit mailbox notices, and cancellation (#40) records a `turn/end` every time.
+- [#13859](https://github.com/deepseek-ai/deepseek-harness/discussions/13859) aborted parent turn leaves child without a settle line; a stop notice wakes the idle parent and the model re-dispatches → part 1 covered: the cancel path (#40) appends `turn/end{reason:cancelled}` every time. Part 2 **ported in #50**: `Notice.Wake *bool` — `wake:false` enqueues for the next turn instead of waking the idle session.
 - [#13863](https://github.com/deepseek-ai/deepseek-harness/discussions/13863) restart-cost economics / handoff → `turn/usage` accounting (#7) plus `Fork` (#42) covers the primitives; the EOQ policy itself is host-side.
 - [#13858](https://github.com/deepseek-ai/deepseek-harness/discussions/13858) stable reference back to an original session event → every event carries a durable `seq`; `session id + seq` is already addressable (`after_seq` resume, `?n=` tail).
 - [#13855](https://github.com/deepseek-ai/deepseek-harness/discussions/13855) maintenance phase reports `idle` → no maintenance phase; a session is either in a cancellable turn or not.
