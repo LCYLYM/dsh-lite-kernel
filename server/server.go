@@ -43,6 +43,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", s.postMessage)
 	mux.HandleFunc("GET /v1/sessions/{id}/events", s.streamEvents)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
+	mux.HandleFunc("GET /v1/sessions/{id}/tail", s.tailSession)
+	mux.HandleFunc("DELETE /v1/sessions/{id}", s.deleteSession)
 	return mux
 }
 
@@ -70,6 +72,41 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"id": ses.ID, "events": ses.Log.Len()})
+}
+
+// tailSession returns up to ?n= trailing events (default 50, capped
+// at 500) — the cheap way to render a long session without streaming
+// its whole log.
+func (s *Server) tailSession(w http.ResponseWriter, r *http.Request) {
+	ses, err := s.Store.Get(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	n := 50
+	if v := r.URL.Query().Get("n"); v != "" {
+		parsed, perr := strconv.Atoi(v)
+		if perr != nil || parsed < 0 || parsed > 500 {
+			http.Error(w, "n must be 0-500", http.StatusBadRequest)
+			return
+		}
+		n = parsed
+	}
+	evs, err := ses.Log.Tail(n)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"events": evs})
+}
+
+// deleteSession removes the session's durable log.
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
+	if err := s.Store.Delete(r.PathValue("id")); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // postMessage starts a turn in the background and returns immediately;

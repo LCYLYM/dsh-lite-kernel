@@ -101,6 +101,22 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
+// Delete removes the session's log file and drops it from the live
+// set; deleting a missing session is a no-op so retries stay safe.
+func (s *Store) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.dir, id+".jsonl")
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if ses, ok := s.live[id]; ok {
+		ses.Log.Close()
+		delete(s.live, id)
+	}
+	return os.Remove(path)
+}
+
 // List returns live session ids (a lock-held snapshot, never a stale copy).
 func (s *Store) List() []string {
 	s.mu.Lock()
