@@ -1,7 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -180,5 +185,273 @@ func TestRegistryChildShadowsParentTool(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("shadowed tool advertised %d times", count)
+	}
+}
+
+// bigTool returns an oversized result.
+type bigTool struct{}
+
+func (bigTool) Name() string        { return "big" }
+func (bigTool) Description() string { return "returns a huge payload" }
+func (bigTool) Schema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{}}`)
+}
+func (bigTool) Call(ctx context.Context, args json.RawMessage) (any, error) {
+	return strings.Repeat("x", 200<<10), nil
+}
+
+// bigProvider asks for bigTool once, then finishes.
+type bigProvider struct{ calls int }
+
+func (p *bigProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	p.calls++
+	if p.calls == 1 {
+		return &llm.Response{Message: llm.Message{Role: "assistant",
+			ToolCalls: []llm.ToolCall{{ID: "t1", Name: "big"}}}, FinishReason: "tool_calls"}, nil
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}, nil
+}
+
+func TestToolResultCappedBeforeLog(t *testing.T) {
+	prov := &bigProvider{}
+	loop, lg := newLoop(t, prov)
+	loop.Registry.Register(bigTool{})
+	loop.Guard.MaxToolResultChars = 1024
+	state, err := loop.Run(context.Background(), "go")
+	if err != nil || state != Completed {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	var result map[string]any
+	lg.ReadFrom(0, func(ev session.Event) bool {
+		if ev.Type == "tool/result" {
+			json.Unmarshal(ev.Data, &result)
+		}
+		return true
+	})
+	inner, _ := result["content"].(map[string]any)
+	if inner["truncated"] != true {
+		t.Fatalf("result not marked truncated: %v", result)
+	}
+	if got := len(inner["content"].(string)); got != 1024 {
+		t.Fatalf("cap wrong: %d", got)
+	}
+}
+
+// gateProvider blocks until the gate closes or ctx dies.
+type gateProvider struct{ gate chan struct{} }
+
+func (p *gateProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	select {
+	case <-p.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestCallTimeoutClassifiedRetryable(t *testing.T) {
+	gate := make(chan struct{})
+	loop, _ := newLoop(t, &gateProvider{gate: gate})
+	loop.Guard.CallTimeout = 1
+	loop.Retry = llm.Policy{Retries: 0}
+	defer close(gate)
+	state, err := loop.Run(context.Background(), "hi")
+	if state != Waiting || !strings.Contains(err.Error(), "exceeded 1s") {
+		t.Fatalf("state=%s err=%v — timeout should be a retryable waiting turn", state, err)
+	}
+}
+
+// slowProvider holds the first call until released.
+type slowProvider struct{ gate chan struct{} }
+
+func (p *slowProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	select {
+	case <-p.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestConcurrentRunRejected(t *testing.T) {
+	gate := make(chan struct{})
+	loop, _ := newLoop(t, &slowProvider{gate: gate})
+	go loop.Run(context.Background(), "first")
+	time.Sleep(50 * time.Millisecond)
+	state, err := loop.Run(context.Background(), "second")
+	if !errors.Is(err, ErrTurnBusy) || state != Failed {
+		t.Fatalf("second run: state=%s err=%v", state, err)
+	}
+	close(gate)
+}
+
+// meterProvider reports token usage like a real API.
+type meterProvider struct{ calls int }
+
+func (m *meterProvider) Complete(_ context.Context, _ *llm.Request) (*llm.Response, error) {
+	m.calls++
+	return &llm.Response{
+		Message:      llm.Message{Role: "assistant", Content: "ok"},
+		FinishReason: "stop",
+		Usage:        llm.Usage{InputTokens: 100, OutputTokens: 50},
+	}, nil
+}
+
+// A session whose spend exceeds MaxSessionTokens aborts with a logged
+// budget reason — the durable total, not an in-memory counter.
+func TestSessionTokenBudgetAborts(t *testing.T) {
+	prov := &meterProvider{}
+	loop, lg := newLoop(t, prov)
+	loop.Guard.MaxSessionTokens = 120 // first call spends 150
+	// The step that crossed the cap aborts before tool side effects.
+	state, err := loop.Run(context.Background(), "hi")
+	if state != Aborted || err == nil {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	u := session.Usage(lg)
+	if u.InputTokens != 100 || u.OutputTokens != 50 || u.Steps != 1 {
+		t.Fatalf("usage=%v", u)
+	}
+	// …but the next turn aborts WITHOUT billing the provider.
+	if state, _ := loop.Run(context.Background(), "again"); state != Aborted {
+		t.Fatalf("second run state=%s", state)
+	}
+	if prov.calls != 1 {
+		t.Fatalf("provider called %d times after budget exhausted", prov.calls)
+	}
+}
+
+// capProvider records the message list it is asked to complete.
+type capProvider struct{ msgs []llm.Message }
+
+func (p *capProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	p.msgs = append([]llm.Message(nil), r.Messages...)
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"}, nil
+}
+
+func TestMailboxNoticesReachNextRequest(t *testing.T) {
+	prov := &capProvider{}
+	loop, lg := newLoop(t, prov)
+	if err := Post(lg, Notice{ID: "n1", From: "child-1", Kind: "done",
+		Payload: json.RawMessage(`{"result":42}`)}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loop.Run(context.Background(), "hello")
+	if err != nil || state != Completed {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	found := false
+	for _, m := range prov.msgs {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice from child-1") && strings.Contains(s, `"result":42`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("notice never reached the model request")
+	}
+	if p, _ := Pending(lg); len(p) != 0 {
+		t.Fatal("notice left pending")
+	}
+	// replay on resume injects nothing new — delivered is durable
+	msgs2, _ := session.BuildContext(lg, loop.Budget)
+	seen := 0
+	for _, m := range msgs2 {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice") {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("expected exactly one injected notice, got %d", seen)
+	}
+}
+
+func TestDrainCrashBeforeAckReinjectsInvisible(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lg, _ := session.OpenLog(path)
+	Post(lg, Notice{ID: "n1", From: "c", Kind: "done", Payload: json.RawMessage(`1`)})
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after inject but before ack: strip the delivered
+	// events by rewriting the log without them, then reopen.
+	f, _ := os.ReadFile(path)
+	kept := []byte{}
+	for _, line := range bytes.Split(f, []byte("\n")) {
+		if len(line) > 0 && !bytes.Contains(line, []byte("delivered")) {
+			kept = append(append(kept, line...), '\n')
+		}
+	}
+	os.WriteFile(path, kept, 0o600)
+	lg2, _ := session.OpenLog(path)
+	if err := Drain(lg2); err != nil {
+		t.Fatal(err)
+	}
+	// notice is injected again, but BuildContext dedups by id
+	msgs, _ := session.BuildContext(lg2, session.DefaultBudget())
+	seen := 0
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok && strings.Contains(s, "mailbox notice from c") {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("notice rendered %d times after reinject", seen)
+	}
+}
+
+func TestDrainBatchCapLeavesRestPending(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	for i := 0; i < maxDrainBatch+3; i++ {
+		Post(lg, Notice{ID: fmt.Sprintf("n%d", i), From: "c", Kind: "k", Payload: json.RawMessage(`1`)})
+	}
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	mb := mailboxFor(lg)
+	if len(mb.pending) != 3 {
+		t.Fatalf("expected 3 pending after capped drain, got %d", len(mb.pending))
+	}
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	if len(mb.pending) != 0 {
+		t.Fatal("remaining notices not drained")
+	}
+}
+
+func TestMailboxIndexReleasedOnClose(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	if err := Drain(lg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mailboxes.Load(lg); !ok {
+		t.Fatal("index missing after drain")
+	}
+	lg.Close()
+	if _, ok := mailboxes.Load(lg); ok {
+		t.Fatal("index rooted a closed log")
+	}
+}
+
+func TestIDlessNoticesAllRendered(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	// Two injections carrying ID-less notices — both must render.
+	lg.Append("mailbox/inject", map[string]any{"notices": []map[string]any{
+		{"from": "a", "kind": "k", "payload": json.RawMessage(`1`)},
+		{"from": "b", "kind": "k", "payload": json.RawMessage(`2`)},
+	}})
+	msgs, _ := session.BuildContext(lg, session.DefaultBudget())
+	found := 0
+	for _, m := range msgs {
+		if s, ok := m.Content.(string); ok {
+			found += strings.Count(s, "[mailbox notice")
+		}
+	}
+	if found != 2 {
+		t.Fatalf("id-less notices collapsed: %d rendered", found)
 	}
 }
