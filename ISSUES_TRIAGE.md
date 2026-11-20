@@ -87,3 +87,18 @@ Second triage pass over newer discussions — already benign in the lite kernel:
 - [#13834](https://github.com/deepseek-ai/deepseek-harness/discussions/13834) legacy `turn/end` without `reason` breaks projection → no turn/end projection exists; events are only filtered during context assembly.
 - [#13840](https://github.com/deepseek-ai/deepseek-harness/discussions/13840), [#13826](https://github.com/deepseek-ai/deepseek-harness/discussions/13826), [#13827](https://github.com/deepseek-ai/deepseek-harness/discussions/13827) renderer OOM / jank on long sessions → same class as the bounded-log design (#13639, #13717).
 - [#13829](https://github.com/deepseek-ai/deepseek-harness/discussions/13829) presets colliding in a global tool layer → scoped `kernel.Scope` registration (#13710); residual spec-level dedupe fixed in #34.
+
+| #36 | `after_seq` / `Last-Event-ID` parse errors returned 500 | Bad cursor is a 400 |
+| #37 | [#13812](https://github.com/deepseek-ai/deepseek-harness/discussions/13812): a persisted session invisible until first `Get` — `List` only reported live ids | `List` unions live ids with `session-*.jsonl` files on disk |
+| #38 | [#13790](https://github.com/deepseek-ai/deepseek-harness/discussions/13790): a crashed turn leaves a dangling `tool_call`; strict providers then reject every later request, bricking the session | `BuildContext` splices an interrupted-marker result after a call with no result; synthesized results spend the same byte/event budget |
+| #39 | [#13803](https://github.com/deepseek-ai/deepseek-harness/discussions/13803): one malformed wire frame killed the turn — decode failure wasn't a retryable `CallError` | Undecodable body → `KindTransient` |
+| #40 | [#13766](https://github.com/deepseek-ai/deepseek-harness/discussions/13766): no way to abort an in-flight turn | `POST /v1/sessions/{id}/cancel` cancels the turn's context; 409 when idle |
+
+Third triage pass — already benign or by-design in the lite kernel:
+
+- [#13825](https://github.com/deepseek-ai/deepseek-harness/discussions/13825) hold-and-release of pending input at turn boundaries → the durable mailbox already queues notices until a turn consumes them; wake-on-notice keeps an idle session responsive.
+- [#13806](https://github.com/deepseek-ai/deepseek-harness/discussions/13806) replaced stdio MCP servers keep running → no hot-reload of MCP config exists; a `Client` owns its child for its lifetime.
+- [#13787](https://github.com/deepseek-ai/deepseek-harness/discussions/13787) unknown `FinishReason` throws → finish reasons pass through as strings; only `length`/`max_tokens` get special handling, anything else completes normally.
+- [#13799](https://github.com/deepseek-ai/deepseek-harness/discussions/13799) sandboxed tool reads parent env → the file tools carry no environment; the sandboxed `shell` tool (PR #4) launches with a scrubbed env.
+- [#13759](https://github.com/deepseek-ai/deepseek-harness/discussions/13759) dead WS peers never reaped → transport is SSE with a per-request context; a dead client is just a closed response writer.
+- [#13767](https://github.com/deepseek-ai/deepseek-harness/discussions/13767), [#13768](https://github.com/deepseek-ai/deepseek-harness/discussions/13768) checkpoints vs full replay, async consistency → the lite answer is append-only + bounded tail-scan; reopening replays the log, not a checkpoint fork.
