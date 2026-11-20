@@ -61,6 +61,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}/events", s.streamEvents)
 	mux.HandleFunc("GET /v1/sessions/{id}/history", s.history)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
+	mux.HandleFunc("GET /v1/sessions/{id}/tail", s.tailSession)
+	mux.HandleFunc("DELETE /v1/sessions/{id}", s.deleteSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/fork", s.forkSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/cancel", s.cancelTurn)
 	if s.Token != "" {
@@ -151,6 +153,49 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		next = evs[len(evs)-1].Seq
 	}
 	writeJSON(w, map[string]any{"events": evs, "next": next})
+}
+
+// tailSession returns up to ?n= trailing events (default 50, capped
+// at 500) — the cheap way to render a long session without streaming
+// its whole log.
+func (s *Server) tailSession(w http.ResponseWriter, r *http.Request) {
+	ses, err := s.Store.Get(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	n := 50
+	if v := r.URL.Query().Get("n"); v != "" {
+		parsed, perr := strconv.Atoi(v)
+		if perr != nil || parsed < 0 || parsed > 500 {
+			http.Error(w, "n must be 0-500", http.StatusBadRequest)
+			return
+		}
+		n = parsed
+	}
+	evs, err := ses.Log.Tail(n)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"events": evs})
+}
+
+// deleteSession removes the session's durable log. The cached loop is
+// dropped either way: after a failed delete the store may have swapped
+// in a reopened log, and a loop still bound to the closed one would
+// fail every later turn.
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	err := s.Store.Delete(id)
+	s.mu.Lock()
+	delete(s.loops, id)
+	s.mu.Unlock()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // postMessage starts a turn in the background and returns immediately;
@@ -361,6 +406,9 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-ses.Log.Done():
+			// Session deleted: stop instead of heartbeating forever.
 			return
 		case ev, ok := <-ch:
 			if !ok {

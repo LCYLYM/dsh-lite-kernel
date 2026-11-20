@@ -247,6 +247,42 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
+var sessionIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// Delete removes the session's log file and drops it from the live
+// set; deleting a missing session is a no-op so retries stay safe.
+// The id is whitelisted before it joins a path — "..\victim" must not
+// reach a neighbouring file. The file goes first: if removal fails the
+// live entry (and its log) is left usable instead of cached-but-closed.
+func (s *Store) Delete(id string) error {
+	if !sessionIDRE.MatchString(id) {
+		return fmt.Errorf("session: invalid id %q", id)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.dir, id+".jsonl")
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	// Windows refuses to unlink an open file, so the live log closes
+	// before removal; if removal still fails, reopen it so the session
+	// stays usable rather than cached-but-closed.
+	ses, live := s.live[id]
+	if live {
+		delete(s.live, id)
+		ses.Log.Close()
+	}
+	if err := os.Remove(path); err != nil {
+		if live {
+			if lg, rerr := OpenLog(path); rerr == nil {
+				s.live[id] = &Session{ID: id, Workspace: ses.Workspace, Log: lg}
+			}
+		}
+		return err
+	}
+	return nil
+}
+
 // List returns every session the store can serve: live ones plus the
 // session-*.jsonl files on disk — a persisted session must be
 // discoverable before it is first loaded (upstream #13812: disk

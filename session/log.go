@@ -35,6 +35,8 @@ type Log struct {
 	offsets []int64 // byte offset of each event line, index = seq-1... seq starts at 1
 	nextSeq int64
 	subs    map[chan Event]struct{}
+	done    chan struct{}
+	closed  bool
 	compact *Compaction // newest session/compaction marker, if any
 	onClose []func()
 }
@@ -45,7 +47,7 @@ func OpenLog(path string) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{f: f, path: path, nextSeq: 1, subs: map[chan Event]struct{}{}}
+	l := &Log{f: f, path: path, nextSeq: 1, subs: map[chan Event]struct{}{}, done: make(chan struct{})}
 	fi, _ := f.Stat()
 	var size int64
 	if fi != nil {
@@ -317,6 +319,12 @@ func (l *Log) Subscribe(buf int) (<-chan Event, func()) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	ch := make(chan Event, buf)
+	if l.closed {
+		// A closed log emits nothing: hand back a closed channel so a
+		// subscriber's range exits instead of waiting forever.
+		close(ch)
+		return ch, func() {}
+	}
 	l.subs[ch] = struct{}{}
 	return ch, func() {
 		l.mu.Lock()
@@ -326,11 +334,21 @@ func (l *Log) Subscribe(buf int) (<-chan Event, func()) {
 	}
 }
 
+// Done closes when the log does — streamers select on it so a deleted
+// session stops their heartbeat loop instead of pinning the handler.
+func (l *Log) Done() <-chan struct{} { return l.done }
+
 // Close flushes, closes the log file, and runs registered cleanups —
 // indexes keyed on this log (mailbox, projections) release here rather
-// than pinning a closed log forever.
+// than pinning a closed log forever. A second call is a no-op.
 func (l *Log) Close() error {
 	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	close(l.done)
 	cbs := l.onClose
 	l.onClose = nil
 	err := l.f.Close()
