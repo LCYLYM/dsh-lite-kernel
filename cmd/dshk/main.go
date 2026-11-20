@@ -26,7 +26,7 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run|ls|msg|fork|cancel|tail|history|rm> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run|ls|msg|notice|fork|cancel|tail|history|rm> [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -34,7 +34,7 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
-	case "ls", "msg", "fork", "cancel", "tail", "history", "rm":
+	case "ls", "msg", "fork", "cancel", "tail", "history", "rm", "notice":
 		cmdAPI(os.Args[1], os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
@@ -121,6 +121,22 @@ func cmdAPI(name string, args []string) {
 		call("GET", id(0)+"/history"+q, "")
 	case "rm":
 		call("DELETE", id(0), "")
+	case "notice":
+		// dshk notice <id> [-nowake] text… — enqueues a durable notice;
+		// -nowake leaves it for the next turn instead of waking an idle
+		// session (port of upstream #13859's abort-loop fix).
+		wake := true
+		rest := args[1:]
+		if len(rest) > 0 && rest[0] == "-nowake" {
+			wake = false
+			rest = rest[1:]
+		}
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "usage: dshk notice <session-id> [-nowake] text...\n")
+			os.Exit(2)
+		}
+		body, _ := json.Marshal(map[string]any{"text": strings.Join(rest, " "), "wake": wake})
+		call("POST", id(0)+"/notices", string(body))
 	}
 }
 
@@ -224,6 +240,7 @@ func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	dir := fs.String("data", ".dshk/sessions", "session data dir")
 	ws := fs.String("workspace", ".", "workspace root")
+	sid := fs.String("session", "", "existing session id to continue instead of creating one")
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: dshk run [flags] \"task\"")
@@ -233,8 +250,12 @@ func cmdRun(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ses, err := store.Create(*ws)
-	if err != nil {
+	var ses *session.Session
+	if *sid != "" {
+		if ses, err = store.Get(*sid); err != nil {
+			log.Fatal(err)
+		}
+	} else if ses, err = store.Create(*ws); err != nil {
 		log.Fatal(err)
 	}
 	prov, model := provider()
