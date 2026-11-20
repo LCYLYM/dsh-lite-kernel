@@ -70,6 +70,11 @@ func cmdAPI(name string, args []string) {
 			if req.URL.Scheme == "http" && via[0].URL.Scheme == "https" {
 				return fmt.Errorf("refusing https→http redirect to %s", req.URL)
 			}
+			// A custom hook replaces Go's built-in redirect cap —
+			// keep one or a looping proxy hangs the CLI forever.
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
 			return nil
 		},
 	}
@@ -277,8 +282,16 @@ func cmdRun(args []string) {
 		}
 		// The session's own workspace wins over the "." default —
 		// tools must act where the session was created, not wherever
-		// this command happens to run.
+		// this command happens to run. It is recorded by whatever
+		// client created the session, so adopting it is visible and
+		// fail-loud rather than silent.
 		if !wsSet {
+			if st, err := os.Stat(ses.Workspace); err != nil || !st.IsDir() {
+				log.Fatalf("session %s records workspace %q which is not a directory here — pass -workspace explicitly", ses.ID, ses.Workspace)
+			}
+			if ses.Workspace != "." {
+				log.Printf("resuming in recorded workspace %s", ses.Workspace)
+			}
 			*ws = ses.Workspace
 		}
 	} else if ses, err = store.Create(*ws); err != nil {
