@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/LCYLYM/dsh-lite-kernel/llm"
@@ -17,10 +18,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -87,7 +88,20 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 				Messages: msgs,
 				Tools:    l.Registry.Specs(),
 			})
-			return e
+			if e != nil {
+				return e
+			}
+			// EMPTY_RESPONSE (upstream #13822): a "stop" answer carrying no
+			// text and no tool call is not a completed step — deepseek's
+			// reasoning-only drafts hit this. Retry through the same
+			// policy as transient faults; if it stays empty the turn goes
+			// Waiting instead of silently "completing".
+			if len(resp.Message.ToolCalls) == 0 &&
+				strings.TrimSpace(contentText(resp.Message.Content)) == "" {
+				return &llm.CallError{Kind: llm.KindTransient,
+					Message: "llm: provider returned an empty message"}
+			}
+			return nil
 		})
 		if err != nil {
 			// Retry budget spent → Waiting is an explicit, logged state.
@@ -105,7 +119,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
 
 		// Guard: repetition / no-progress / caps.
