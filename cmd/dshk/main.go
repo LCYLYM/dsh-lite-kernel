@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -23,7 +24,7 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run|ls|msg|fork|cancel|tail|history|rm> [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -31,9 +32,79 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
+	case "ls", "msg", "fork", "cancel", "tail", "history", "rm":
+		cmdAPI(os.Args[1], os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)
+	}
+}
+
+// cmdAPI is the thin client half of dshk: every operation the server
+// exposes gets a subcommand so sessions can be managed without curl.
+// Target: DSHK_ADDR (default 127.0.0.1:3080), bearer DSHK_TOKEN.
+func cmdAPI(name string, args []string) {
+	addr := os.Getenv("DSHK_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:3080"
+	}
+	base := "http://" + addr + "/v1/sessions"
+	call := func(method, path, body string) {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, base+path, rdr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if tok := os.Getenv("DSHK_TOKEN"); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer res.Body.Close()
+		io.Copy(os.Stdout, res.Body)
+		if res.StatusCode >= 400 {
+			os.Exit(1)
+		}
+		fmt.Println()
+	}
+	arg := func(i int) string {
+		if len(args) <= i {
+			fmt.Fprintf(os.Stderr, "usage: dshk %s <session-id> ...\n", name)
+			os.Exit(2)
+		}
+		return args[i]
+	}
+	switch name {
+	case "ls":
+		call("GET", "", "")
+	case "msg":
+		call("POST", "/"+arg(0)+"/messages", fmt.Sprintf("{\"text\": %q}", arg(1)))
+	case "fork":
+		call("POST", "/"+arg(0)+"/fork", "")
+	case "cancel":
+		call("POST", "/"+arg(0)+"/cancel", "")
+	case "tail":
+		n := "200"
+		if len(args) > 1 {
+			n = args[1]
+		}
+		call("GET", "/"+arg(0)+"/tail?n="+n, "")
+	case "history":
+		q := ""
+		if len(args) > 1 {
+			q = "?after=" + args[1]
+		}
+		call("GET", "/"+arg(0)+"/history"+q, "")
+	case "rm":
+		call("DELETE", "/"+arg(0), "")
 	}
 }
 
