@@ -119,12 +119,21 @@ func (s *Store) Delete(id string) error {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if err := os.Remove(path); err != nil {
-		return err
-	}
-	if ses, ok := s.live[id]; ok {
-		ses.Log.Close()
+	// Windows refuses to unlink an open file, so the live log closes
+	// before removal; if removal still fails, reopen it so the session
+	// stays usable rather than cached-but-closed.
+	ses, live := s.live[id]
+	if live {
 		delete(s.live, id)
+		ses.Log.Close()
+	}
+	if err := os.Remove(path); err != nil {
+		if live {
+			if lg, rerr := OpenLog(path); rerr == nil {
+				s.live[id] = &Session{ID: id, Workspace: ses.Workspace, Log: lg}
+			}
+		}
+		return err
 	}
 	return nil
 }
