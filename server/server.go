@@ -215,6 +215,9 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-ses.Log.Done():
+			// Session deleted: stop instead of heartbeating forever.
+			return
 		case ev, ok := <-ch:
 			if !ok || !send(ev) {
 				return

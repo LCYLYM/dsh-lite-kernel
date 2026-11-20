@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 )
 
@@ -101,20 +102,31 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
+var sessionIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 // Delete removes the session's log file and drops it from the live
 // set; deleting a missing session is a no-op so retries stay safe.
+// The id is whitelisted before it joins a path — "..\victim" must not
+// reach a neighbouring file. The file goes first: if removal fails the
+// live entry (and its log) is left usable instead of cached-but-closed.
 func (s *Store) Delete(id string) error {
+	if !sessionIDRE.MatchString(id) {
+		return fmt.Errorf("session: invalid id %q", id)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	path := filepath.Join(s.dir, id+".jsonl")
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
 	if ses, ok := s.live[id]; ok {
 		ses.Log.Close()
 		delete(s.live, id)
 	}
-	return os.Remove(path)
+	return nil
 }
 
 // List returns live session ids (a lock-held snapshot, never a stale copy).

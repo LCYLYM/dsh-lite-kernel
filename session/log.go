@@ -32,6 +32,8 @@ type Log struct {
 	offsets []int64 // byte offset of each event line, index = seq-1... seq starts at 1
 	nextSeq int64
 	subs    map[chan Event]struct{}
+	done    chan struct{}
+	closed  bool
 }
 
 // OpenLog opens (or creates) the log at path and rebuilds its offset index.
@@ -40,7 +42,7 @@ func OpenLog(path string) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{f: f, path: path, nextSeq: 1, subs: map[chan Event]struct{}{}}
+	l := &Log{f: f, path: path, nextSeq: 1, subs: map[chan Event]struct{}{}, done: make(chan struct{})}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	var off int64
@@ -165,9 +167,18 @@ func (l *Log) Subscribe(buf int) (<-chan Event, func()) {
 	}
 }
 
-// Close flushes and closes the log file.
+// Done closes when the log does — streamers select on it so a deleted
+// session stops their heartbeat loop instead of pinning the handler.
+func (l *Log) Done() <-chan struct{} { return l.done }
+
+// Close flushes and closes the log file; a second call is a no-op.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+	close(l.done)
 	return l.f.Close()
 }
