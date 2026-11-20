@@ -100,9 +100,17 @@ func (s *Server) tailSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"events": evs})
 }
 
-// deleteSession removes the session's durable log.
+// deleteSession removes the session's durable log. The cached loop is
+// dropped either way: after a failed delete the store may have swapped
+// in a reopened log, and a loop still bound to the closed one would
+// fail every later turn.
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
-	if err := s.Store.Delete(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	err := s.Store.Delete(id)
+	s.mu.Lock()
+	delete(s.loops, id)
+	s.mu.Unlock()
+	if err != nil {
 		writeErr(w, err)
 		return
 	}
