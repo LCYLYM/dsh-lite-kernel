@@ -88,9 +88,14 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loop := s.loopFor(ses)
+	if loop.Busy() {
+		http.Error(w, "turn already in progress", http.StatusConflict)
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
+		defer s.dropLoop(ses.ID)
 		if _, err := loop.Run(ctx, body.Text); err != nil {
 			log.Printf("session %s: turn ended: %v", ses.ID, err)
 		}
@@ -213,4 +218,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func writeErr(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// dropLoop forgets a session's loop once its turn ends — the loop is
+// cheap to rebuild from the log, so holding every past loop in the map
+// would grow server memory with session count, not with live turns.
+func (s *Server) dropLoop(id string) {
+	s.mu.Lock()
+	delete(s.loops, id)
+	s.mu.Unlock()
 }
