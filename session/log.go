@@ -8,7 +8,9 @@ package session
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -97,24 +99,35 @@ func (l *Log) Append(typ string, data any) (Event, error) {
 }
 
 // ReadFrom reads events with seq >= after+1, calling fn per event in
-// order, stopping when fn returns false or an error occurs.
+// order, stopping when fn returns false or an error occurs. It reads
+// through a private descriptor: a slow client replaying a large log
+// must not hold l.mu — appends and other reads would stall for the
+// whole scan (the same class of jank upstream reports for big
+// sessions).
 func (l *Log) ReadFrom(after int64, fn func(Event) bool) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.readFrom(after, fn)
-}
-
-func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 	if after < 0 {
 		after = 0
 	}
 	if after >= l.nextSeq-1 {
+		l.mu.Unlock()
 		return nil
 	}
-	if _, err := l.f.Seek(l.offsets[after], 0); err != nil {
+	off := l.offsets[after]
+	l.mu.Unlock()
+
+	f, err := os.Open(l.path)
+	if err != nil {
 		return err
 	}
-	r := bufio.NewReaderSize(l.f, 1<<20)
+	defer f.Close()
+	if _, err := f.Seek(off, 0); err != nil {
+		return err
+	}
+	return readEvents(bufio.NewReaderSize(f, 1<<20), fn)
+}
+
+func readEvents(r *bufio.Reader, fn func(Event) bool) error {
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 {
@@ -126,7 +139,7 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 			}
 		}
 		if err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -137,13 +150,27 @@ func (l *Log) readFrom(after int64, fn func(Event) bool) error {
 // Tail returns up to n trailing events — O(n), no full scan.
 func (l *Log) Tail(n int) ([]Event, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	if l.nextSeq <= 1 {
+		l.mu.Unlock()
+		return nil, nil
+	}
 	start := l.nextSeq - 1 - int64(n)
 	if start < 0 {
 		start = 0
 	}
+	off := l.offsets[start]
+	l.mu.Unlock()
+
+	f, err := os.Open(l.path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, 0); err != nil {
+		return nil, err
+	}
 	var out []Event
-	err := l.readFrom(start, func(ev Event) bool {
+	err = readEvents(bufio.NewReaderSize(f, 1<<20), func(ev Event) bool {
 		out = append(out, ev)
 		return true
 	})

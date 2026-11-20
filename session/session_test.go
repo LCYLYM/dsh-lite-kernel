@@ -109,3 +109,39 @@ func TestRetryMarkerSkipped(t *testing.T) {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
 	}
 }
+
+// A slow replay must not stall appends — ReadFrom reads through a
+// private descriptor, so writers never queue behind a client scan.
+func TestReplayDoesNotBlockAppends(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(filepath.Join(dir, "s.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		lg.Append("user/message", map[string]any{"role": "user", "content": i})
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			lg.Append("user/message", map[string]any{"role": "user", "content": "x"})
+		}
+	}()
+	var n int
+	err = lg.ReadFrom(0, func(ev Event) bool { n++; return true })
+	close(stop)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 2000 {
+		t.Fatalf("replay saw %d events", n)
+	}
+}
