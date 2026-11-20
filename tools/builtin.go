@@ -99,16 +99,20 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 // failure never masks a successful write. Two writers never share a
 // temp name.
 func writeAtomic(path, wsRoot string, data []byte) error {
-	var dirs []*os.File
+	type dirFD struct {
+		path string
+		f    *os.File
+	}
+	var dirs []dirFD
 	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
 		d, err := os.Open(dir)
 		if err != nil {
 			for _, f := range dirs {
-				f.Close()
+				f.f.Close()
 			}
 			return fmt.Errorf("tools: open dir %q: %w", dir, err)
 		}
-		dirs = append(dirs, d)
+		dirs = append(dirs, dirFD{dir, d})
 		if dir == wsRoot {
 			break
 		}
@@ -118,7 +122,7 @@ func writeAtomic(path, wsRoot string, data []byte) error {
 	}
 	defer func() {
 		for _, d := range dirs {
-			d.Close()
+			d.f.Close()
 		}
 	}()
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
@@ -142,8 +146,26 @@ func writeAtomic(path, wsRoot string, data []byte) error {
 		return err
 	}
 	for _, d := range dirs {
-		if err := d.Sync(); err != nil {
-			return fmt.Errorf("tools: sync dir: %w", err)
+		f := d.f
+		// The directory may have been replaced between open and rename;
+		// the open fd would then sync a stale inode. Reopen the current
+		// path when it no longer names the same directory.
+		if cur, err := os.Open(d.path); err == nil {
+			ci, _ := cur.Stat()
+			oi, _ := f.Stat()
+			if ci != nil && oi != nil && !os.SameFile(ci, oi) {
+				f.Close()
+				f = cur
+			} else {
+				cur.Close()
+			}
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("tools: sync dir %q: %w", d.path, err)
+		}
+		if f != d.f {
+			f.Close()
 		}
 	}
 	return nil
