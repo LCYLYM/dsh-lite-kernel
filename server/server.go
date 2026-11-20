@@ -178,9 +178,16 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Replay from the durable log — this is what makes the stream
-	//    resumable instead of permanently dead (#13747).
+	//    resumable instead of permanently dead (#13747). The live
+	//    subscription was taken first, so an event appended mid-replay
+	//    lands in BOTH places; send each seq once.
+	var lastSeq int64
 	replayErr := ses.Log.ReadFrom(after, func(ev session.Event) bool {
-		return send(ev)
+		if !send(ev) {
+			return false
+		}
+		lastSeq = ev.Seq
+		return true
 	})
 	if replayErr != nil {
 		return
@@ -194,9 +201,16 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case ev, ok := <-ch:
-			if !ok || !send(ev) {
+			if !ok {
 				return
 			}
+			if ev.Seq <= lastSeq {
+				continue
+			}
+			if !send(ev) {
+				return
+			}
+			lastSeq = ev.Seq
 		case <-heartbeat.C:
 			_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 			if _, err := fmt.Fprintf(w, ": hb\n\n"); err != nil {
