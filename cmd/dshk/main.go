@@ -58,7 +58,21 @@ func cmdAPI(name string, args []string) {
 	if scheme == "http" && !loopback && os.Getenv("DSHK_INSECURE") == "" {
 		log.Fatalf("refusing to send DSHK_TOKEN over cleartext HTTP to %s — use https:// or set DSHK_INSECURE=1", addr)
 	}
+	addr = strings.TrimRight(addr, "/")
 	base := scheme + "://" + addr + "/v1/sessions"
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// A redirect may not carry the bearer token to another
+			// host or downgrade the scheme — Go would forward it.
+			if req.URL.Scheme != via[0].URL.Scheme || !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+				req.Header.Del("Authorization")
+			}
+			if req.URL.Scheme == "http" && via[0].URL.Scheme == "https" {
+				return fmt.Errorf("refusing https→http redirect to %s", req.URL)
+			}
+			return nil
+		},
+	}
 	call := func(method, path, body string) {
 		var rdr io.Reader
 		if body != "" {
@@ -74,7 +88,7 @@ func cmdAPI(name string, args []string) {
 		if tok := os.Getenv("DSHK_TOKEN"); tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		res, err := http.DefaultClient.Do(req)
+		res, err := client.Do(req)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -135,7 +149,7 @@ func cmdAPI(name string, args []string) {
 			fmt.Fprintf(os.Stderr, "usage: dshk notice <session-id> [-nowake] text...\n")
 			os.Exit(2)
 		}
-		body, _ := json.Marshal(map[string]any{"text": strings.Join(rest, " "), "wake": wake})
+		body, _ := json.Marshal(map[string]any{"payload": strings.Join(rest, " "), "wake": wake, "from": "dshk"})
 		call("POST", id(0)+"/notices", string(body))
 	}
 }
@@ -242,6 +256,12 @@ func cmdRun(args []string) {
 	ws := fs.String("workspace", ".", "workspace root")
 	sid := fs.String("session", "", "existing session id to continue instead of creating one")
 	_ = fs.Parse(args)
+	wsSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "workspace" {
+			wsSet = true
+		}
+	})
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: dshk run [flags] \"task\"")
 		os.Exit(2)
@@ -254,6 +274,12 @@ func cmdRun(args []string) {
 	if *sid != "" {
 		if ses, err = store.Get(*sid); err != nil {
 			log.Fatal(err)
+		}
+		// The session's own workspace wins over the "." default —
+		// tools must act where the session was created, not wherever
+		// this command happens to run.
+		if !wsSet {
+			*ws = ses.Workspace
 		}
 	} else if ses, err = store.Create(*ws); err != nil {
 		log.Fatal(err)
