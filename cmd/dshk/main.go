@@ -294,8 +294,13 @@ func cmdRun(args []string) {
 			}
 			*ws = ses.Workspace
 		}
-		// A session with no recorded workspace keeps the flag
-		// default — "" is "not recorded", not "the empty dir".
+		// A session with no recorded workspace ran against the
+		// daemon's serve-time root, which this command cannot see —
+		// require an explicit -workspace rather than silently
+		// pointing tools at the caller's cwd.
+		if !wsSet && ses.Workspace == "" {
+			log.Fatalf("session %s records no workspace (daemon-rooted) — pass -workspace explicitly", ses.ID)
+		}
 	} else if ses, err = store.Create(*ws); err != nil {
 		log.Fatal(err)
 	}
