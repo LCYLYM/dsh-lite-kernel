@@ -115,6 +115,11 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	ch := make(chan rpcMsg, 1)
 	c.pending[id] = ch
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+	}()
 
 	body, err := json.Marshal(rpcMsg{JSONRPC: "2.0", ID: id, Method: method, Params: mustJSON(params)})
 	if err != nil {
@@ -128,11 +133,13 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	}
 	select {
 	case <-ctx.Done():
-		c.mu.Lock()
-		delete(c.pending, id)
-		c.mu.Unlock()
+		// A response that raced in before the slot was dropped still
+		// wins — including its error.
 		select {
 		case m := <-ch:
+			if m.Error != nil {
+				return nil, fmt.Errorf("mcp: %s: %s", method, m.Error.Message)
+			}
 			return m.Result, nil
 		default:
 		}
