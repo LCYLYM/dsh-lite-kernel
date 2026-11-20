@@ -111,6 +111,93 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	}
 }
 
+func TestOpenLogValidatesSeqs(t *testing.T) {
+	dir := t.TempDir()
+	good := `{"seq":1,"type":"a","data":{},"ts":"x"}` + "\n" +
+		`{"seq":2,"type":"b","data":{},"ts":"x"}` + "\n"
+	// partial tail: truncated to committed content, open succeeds
+	p := filepath.Join(dir, "t.jsonl")
+	os.WriteFile(p, []byte(good+`{"seq":3,"ty`), 0o600)
+	lg, err := OpenLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lg.Len() != 2 {
+		t.Fatalf("Len=%d", lg.Len())
+	}
+	fi, _ := os.Stat(p)
+	if fi.Size() != int64(len(good)) {
+		t.Fatal("partial tail not truncated")
+	}
+	// appends continue from seq 3
+	if ev, _ := lg.Append("c", nil); ev.Seq != 3 {
+		t.Fatalf("next seq %d", ev.Seq)
+	}
+	lg.Close()
+	// corrupt middle line → fail loud
+	p2 := filepath.Join(dir, "m.jsonl")
+	os.WriteFile(p2, []byte(good+"garbage\n"+`{"seq":3,"type":"c","data":{},"ts":"x"}`+"\n"), 0o600)
+	if _, err := OpenLog(p2); err == nil {
+		t.Fatal("mid-log corruption accepted")
+	}
+	// seq gap → fail loud
+	p3 := filepath.Join(dir, "g.jsonl")
+	os.WriteFile(p3, []byte(good+`{"seq":9,"type":"c","data":{},"ts":"x"}`+"\n"), 0o600)
+	if _, err := OpenLog(p3); err == nil {
+		t.Fatal("seq gap accepted")
+	}
+}
+
+// CRLF endings: offsets must count real bytes — a Scanner strips '\r'
+// and would cut the truncation inside a committed event's newline.
+func TestOpenLogCRLFTail(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "crlf.jsonl")
+	os.WriteFile(p, []byte("{\"seq\":1,\"type\":\"a\",\"data\":{},\"ts\":\"x\"}\r\n{\"seq\":"), 0o600)
+	lg, err := OpenLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lg.Len() != 1 {
+		t.Fatalf("Len=%d", lg.Len())
+	}
+	if ev, _ := lg.Append("b", nil); ev.Seq != 2 {
+		t.Fatalf("seq %d", ev.Seq)
+	}
+	lg.Close()
+	// reopen must succeed — the append landed after a clean newline
+	lg2, err := OpenLog(p)
+	if err != nil {
+		t.Fatalf("reopen after CRLF recovery: %v", err)
+	}
+	if lg2.Len() != 2 {
+		t.Fatalf("reopened Len=%d", lg2.Len())
+	}
+}
+
+// A valid final event with no trailing newline is terminated at open —
+// otherwise the next append glues onto its line and corrupts the log.
+func TestOpenLogUnterminatedFinal(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "u.jsonl")
+	os.WriteFile(p, []byte(`{"seq":1,"type":"a","data":{},"ts":"x"}`), 0o600) // no \n
+	lg, err := OpenLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lg.Append("b", nil); err != nil {
+		t.Fatal(err)
+	}
+	lg.Close()
+	lg2, err := OpenLog(p)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if lg2.Len() != 2 {
+		t.Fatalf("Len=%d", lg2.Len())
+	}
+}
+
 func TestReadFromSurfacesCorruption(t *testing.T) {
 	dir := t.TempDir()
 	lg, err := OpenLog(filepath.Join(dir, "x.jsonl"))
@@ -118,6 +205,7 @@ func TestReadFromSurfacesCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	lg.Append("user/message", map[string]any{"role": "user", "content": "a"})
+	lg.Append("user/message", map[string]any{"role": "user", "content": "b"})
 	lg.Close()
 	// corrupt a line in the middle, keep a valid tail
 	f, _ := os.ReadFile(filepath.Join(dir, "x.jsonl"))
@@ -125,12 +213,8 @@ func TestReadFromSurfacesCorruption(t *testing.T) {
 	f2, _ := os.Create(filepath.Join(dir, "x.jsonl"))
 	f2.WriteString("not-json\n" + lines[1])
 	f2.Close()
-	lg2, err := OpenLog(filepath.Join(dir, "x.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lg2.Close()
-	if err := lg2.ReadFrom(0, func(Event) bool { return true }); err == nil ||
+	// open-time validation surfaces mid-log corruption loudly
+	if _, err := OpenLog(filepath.Join(dir, "x.jsonl")); err == nil ||
 		!strings.Contains(err.Error(), "corrupt") {
 		t.Fatalf("mid-log corruption not surfaced: %v", err)
 	}

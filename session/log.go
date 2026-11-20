@@ -46,30 +46,84 @@ func OpenLog(path string) (*Log, error) {
 		return nil, err
 	}
 	l := &Log{f: f, path: path, nextSeq: 1, subs: map[chan Event]struct{}{}}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	fi, _ := f.Stat()
+	var size int64
+	if fi != nil {
+		size = fi.Size()
+	}
+	// ReadBytes keeps raw line endings: offsets, truncation points and the
+	// last-line test all operate on real byte positions — a Scanner would
+	// strip the '\r' of CRLF endings and misplace the truncation cut.
+	r := bufio.NewReaderSize(f, 1<<20)
 	var off int64
-	for sc.Scan() {
-		l.offsets = append(l.offsets, off)
-		if bytes.Contains(sc.Bytes(), []byte("session/compaction")) {
-			var ev Event
-			if json.Unmarshal(sc.Bytes(), &ev) == nil && ev.Type == "session/compaction" {
+	for {
+		raw, rerr := r.ReadBytes('\n')
+		if len(raw) == 0 {
+			if rerr != nil && rerr != io.EOF {
+				f.Close()
+				return nil, fmt.Errorf("session: corrupt log %s: %w", path, rerr)
+			}
+			break
+		}
+		line := bytes.TrimRight(raw, "\r\n")
+		var ev Event
+		jerr := json.Unmarshal(line, &ev)
+		switch {
+		case jerr == nil && ev.Seq == l.nextSeq:
+			l.offsets = append(l.offsets, off)
+			l.nextSeq++
+			if ev.Type == "session/compaction" {
 				var c Compaction
 				if json.Unmarshal(ev.Data, &c) == nil {
 					l.compact = &c
 				}
 			}
+		case jerr != nil && off+int64(len(raw)) >= size:
+			// Unparseable LAST line: a crash mid-append never committed —
+			// drop the uncommitted tail so later appends don't leave the
+			// garbage embedded in the middle of the log.
+			if err := f.Truncate(off); err != nil {
+				f.Close()
+				return nil, err
+			}
+			size = off
+		default:
+			f.Close()
+			return nil, fmt.Errorf("session: corrupt log %s at seq %d", path, l.nextSeq)
 		}
-		off += int64(len(sc.Bytes())) + 1
-		l.nextSeq++
-	}
-	if err := sc.Err(); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("session: corrupt log %s: %w", path, err)
+		off += int64(len(raw))
+		if rerr != nil {
+			if rerr != io.EOF {
+				f.Close()
+				return nil, fmt.Errorf("session: corrupt log %s: %w", path, rerr)
+			}
+			break
+		}
 	}
 	if _, err := f.Seek(0, 2); err != nil {
 		f.Close()
 		return nil, err
+	}
+	// A valid final event that was never newline-terminated (writer
+	// exited between the data and the '\n') is still committed — but
+	// appending now would glue the next event onto its line. Terminate
+	// it so the log stays well-formed.
+	if size > 0 {
+		if _, err := f.Seek(-1, 2); err != nil {
+			f.Close()
+			return nil, err
+		}
+		var last [1]byte
+		if _, err := f.Read(last[:]); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if last[0] != '\n' {
+			if _, err := f.Write([]byte{'\n'}); err != nil {
+				f.Close()
+				return nil, err
+			}
+		}
 	}
 	return l, nil
 }
