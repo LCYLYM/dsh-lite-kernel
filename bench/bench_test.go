@@ -96,3 +96,44 @@ func BenchmarkLongSessionContext(b *testing.B) {
 		_ = fmt.Sprint(msgs[0].Role)
 	}
 }
+
+// Reopening a long session: the per-line offset index is O(events) but
+// constant-memory — this is the "load a big conversation" path upstream
+// users report stalling on.
+func BenchmarkOpenLongLog(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	lg, _ := session.OpenLog(path)
+	for i := 0; i < 50000; i++ {
+		lg.Append("assistant/message", map[string]any{"role": "assistant", "content": string(make([]byte, 200))})
+	}
+	lg.Close()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		l, err := session.OpenLog(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		l.Close()
+	}
+}
+
+// Full replay of a long session — the SSE catch-up path.
+func BenchmarkReplayLongLog(b *testing.B) {
+	dir := b.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	for i := 0; i < 50000; i++ {
+		lg.Append("assistant/message", map[string]any{"role": "assistant", "content": string(make([]byte, 200))})
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var n int
+		err := lg.ReadFrom(0, func(ev session.Event) bool { n++; return true })
+		if err != nil {
+			b.Fatal(err)
+		}
+		if n != 50000 {
+			b.Fatalf("replayed %d", n)
+		}
+	}
+}

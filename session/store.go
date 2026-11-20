@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -80,30 +81,92 @@ func (s *Store) Create(workspace string) (*Session, error) {
 	return s.create(workspace)
 }
 
-func (s *Store) create(workspace string) (*Session, error) {
-	s.seq++
-	// Time-based component: two `dshk run`s on the same data dir must not
-	// mint the same id and silently share a log. The seq is seeded from
-	// disk at NewStore, so it stays unique for the life of the data dir.
-	id := fmt.Sprintf("session-%d-%d", time.Now().UnixNano(), s.seq)
-	path := filepath.Join(s.dir, id+".jsonl")
-	lg, err := OpenLog(path)
+// Fork clones a session's durable log into a new id — cheap by design:
+// the copy is a stream (io.Copy), never a full parse, so forking a
+// 50 MB history costs one sequential read instead of the upstream's
+// load-everything fork stall.
+func (s *Store) Fork(id string) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src := filepath.Join(s.dir, id+".jsonl")
+	if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w %q", ErrNotFound, id)
+	}
+	var ws string
+	if old, ok := s.live[id]; ok {
+		ws = old.Workspace
+	}
+	in, err := os.Open(src)
 	if err != nil {
 		return nil, err
 	}
-	// Workspace is durable: it rides in the log so a session reloaded
-	// from disk (after restart or eviction) keeps its binding. Not
-	// model-visible — BuildContext skips event types it does not know.
-	now := time.Now().Unix()
-	if _, err := lg.Append("session/meta", map[string]any{
-		"workspace": workspace, "created_at": now,
-	}); err != nil {
-		_ = lg.Close()
+	defer in.Close()
+
+	// create() never reuses an on-disk id, so the destination is always a
+	// fresh file distinct from the source.
+	ses, err := s.create(ws)
+	if err != nil {
 		return nil, err
 	}
-	ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: now}
-	s.live[id] = ses
+	out, err := os.OpenFile(ses.Log.path, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*Session, error) {
+		out.Close()
+		ses.Log.Close()
+		delete(s.live, ses.ID)
+		os.Remove(ses.Log.path)
+		return nil, err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		return fail(err)
+	}
+	// The copy is the fork's whole history — fsync before acknowledging
+	// like Append does, or a crash can lose an "accepted" fork.
+	if err := out.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := out.Close(); err != nil {
+		return fail(err)
+	}
+	if err := ses.Log.reindex(); err != nil {
+		return fail(err)
+	}
 	return ses, nil
+}
+
+// create allocates a fresh on-disk session: the id loop never reuses a
+// name that exists on disk — after a restart seq is reseeded, and a
+// reused name would reopen (or truncate) another session's log.
+func (s *Store) create(workspace string) (*Session, error) {
+	for {
+		s.seq++
+		id := fmt.Sprintf("session-%d-%d", time.Now().UnixNano(), s.seq)
+		path := filepath.Join(s.dir, id+".jsonl")
+		if _, err := os.Stat(path); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		lg, err := OpenLog(path)
+		if err != nil {
+			return nil, err
+		}
+		// Workspace is durable: it rides in the log so a session reloaded
+		// from disk (after restart or eviction) keeps its binding. Not
+		// model-visible — BuildContext skips event types it does not know.
+		now := time.Now().Unix()
+		if _, err := lg.Append("session/meta", map[string]any{
+			"workspace": workspace, "created_at": now,
+		}); err != nil {
+			_ = lg.Close()
+			return nil, err
+		}
+		ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: now}
+		s.live[id] = ses
+		return ses, nil
+	}
 }
 
 // CreateOrReuseBlank returns an existing blank session for workspace if

@@ -61,6 +61,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}/events", s.streamEvents)
 	mux.HandleFunc("GET /v1/sessions/{id}/history", s.history)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
+	mux.HandleFunc("POST /v1/sessions/{id}/fork", s.forkSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/cancel", s.cancelTurn)
 	if s.Token != "" {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +203,16 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	writeJSON(w, map[string]any{"queued": true})
+}
+
+// forkSession clones the session's durable log under a new id.
+func (s *Server) forkSession(w http.ResponseWriter, r *http.Request) {
+	ses, err := s.Store.Fork(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"id": ses.ID})
 }
 
 // cancelTurn aborts the in-flight turn, if any (upstream #13766 asked
