@@ -33,7 +33,6 @@ type Server struct {
 
 	mu    sync.Mutex
 	loops map[string]*agent.Loop
-	turns map[string]context.CancelFunc
 }
 
 func (s *Server) Handler() http.Handler {
@@ -44,7 +43,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", s.postMessage)
 	mux.HandleFunc("GET /v1/sessions/{id}/events", s.streamEvents)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
-	mux.HandleFunc("POST /v1/sessions/{id}/cancel", s.cancelTurn)
 	return mux
 }
 
@@ -92,43 +90,12 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	loop := s.loopFor(ses)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		s.mu.Lock()
-		if s.turns == nil {
-			s.turns = map[string]context.CancelFunc{}
-		}
-		s.turns[ses.ID] = cancel
-		s.mu.Unlock()
-		defer func() {
-			s.mu.Lock()
-			delete(s.turns, ses.ID)
-			s.mu.Unlock()
-			cancel()
-		}()
+		defer cancel()
 		if _, err := loop.Run(ctx, body.Text); err != nil {
 			log.Printf("session %s: turn ended: %v", ses.ID, err)
 		}
 	}()
 	writeJSON(w, map[string]any{"queued": true})
-}
-
-// cancelTurn aborts the in-flight turn, if any (upstream #13766 asked
-// for session/cancel in the SDK protocol). A session with no active
-// turn gets 409 — cancelling nothing must not look like success.
-func (s *Server) cancelTurn(w http.ResponseWriter, r *http.Request) {
-	ses, err := s.Store.Get(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	s.mu.Lock()
-	cancel, ok := s.turns[ses.ID]
-	s.mu.Unlock()
-	if !ok {
-		http.Error(w, "no active turn", http.StatusConflict)
-		return
-	}
-	cancel()
-	writeJSON(w, map[string]any{"cancelled": true})
 }
 
 // postNotice delivers a cross-agent mailbox notice.
