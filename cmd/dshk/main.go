@@ -4,11 +4,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -48,7 +50,15 @@ func cmdAPI(name string, args []string) {
 	if addr == "" {
 		addr = "127.0.0.1:3080"
 	}
-	base := "http://" + addr + "/v1/sessions"
+	scheme := "http"
+	if strings.HasPrefix(addr, "https://") || strings.HasPrefix(addr, "http://") {
+		scheme, addr, _ = strings.Cut(addr, "://")
+	}
+	loopback := strings.HasPrefix(addr, "127.") || strings.HasPrefix(addr, "localhost") || strings.HasPrefix(addr, "[::1]")
+	if scheme == "http" && !loopback && os.Getenv("DSHK_INSECURE") == "" {
+		log.Fatalf("refusing to send DSHK_TOKEN over cleartext HTTP to %s — use https:// or set DSHK_INSECURE=1", addr)
+	}
+	base := scheme + "://" + addr + "/v1/sessions"
 	call := func(method, path, body string) {
 		var rdr io.Reader
 		if body != "" {
@@ -82,29 +92,31 @@ func cmdAPI(name string, args []string) {
 		}
 		return args[i]
 	}
+	id := func(i int) string { return "/" + url.PathEscape(arg(i)) }
 	switch name {
 	case "ls":
 		call("GET", "", "")
 	case "msg":
-		call("POST", "/"+arg(0)+"/messages", fmt.Sprintf("{\"text\": %q}", arg(1)))
+		body, _ := json.Marshal(map[string]string{"text": strings.Join(args[1:], " ")})
+		call("POST", id(0)+"/messages", string(body))
 	case "fork":
-		call("POST", "/"+arg(0)+"/fork", "")
+		call("POST", id(0)+"/fork", "")
 	case "cancel":
-		call("POST", "/"+arg(0)+"/cancel", "")
+		call("POST", id(0)+"/cancel", "")
 	case "tail":
 		n := "200"
 		if len(args) > 1 {
 			n = args[1]
 		}
-		call("GET", "/"+arg(0)+"/tail?n="+n, "")
+		call("GET", id(0)+"/tail?n="+url.QueryEscape(n), "")
 	case "history":
 		q := ""
 		if len(args) > 1 {
-			q = "?after=" + args[1]
+			q = "?after=" + url.QueryEscape(args[1])
 		}
-		call("GET", "/"+arg(0)+"/history"+q, "")
+		call("GET", id(0)+"/history"+q, "")
 	case "rm":
-		call("DELETE", "/"+arg(0), "")
+		call("DELETE", id(0), "")
 	}
 }
 
