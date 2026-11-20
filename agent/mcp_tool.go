@@ -63,6 +63,12 @@ func (t MCPTool) Call(ctx context.Context, args json.RawMessage) (any, error) {
 		if err := dec.Decode(&a); err != nil {
 			return nil, fmt.Errorf("agent: mcp tool %s got undecodable args: %w", t.Name(), err)
 		}
+		// Anything after the first value is malformed input — without
+		// this check {"a":1}{"b":2} executes with only the first half.
+		var rest any
+		if err := dec.Decode(&rest); err != io.EOF {
+			return nil, fmt.Errorf("agent: mcp tool %s got malformed args (trailing data)", t.Name())
+		}
 	}
 	res, err := t.Client.CallTool(ctx, t.CallTimeout, t.RemoteName, a)
 	if err != nil {
