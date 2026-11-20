@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LCYLYM/dsh-lite-kernel/agent"
@@ -254,7 +256,26 @@ func cmdServe(args []string) {
 		NewLoop: newLoopFactory(store, prov, model, *ws), Token: tok}
 
 	log.Printf("dsh-lite serving on http://%s (workspace %s)", *addr, *ws)
-	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
+
+	// SIGINT/SIGTERM: stop accepting, drain in-flight requests for a
+	// bounded window, then flush every live log (#45's Store.Close is
+	// only useful if something calls it — nothing did).
+	sig, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler()}
+	go func() {
+		<-sig.Done()
+		to, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(to)
+	}()
+	err = httpSrv.ListenAndServe()
+	if cerr := store.Close(); cerr != nil {
+		log.Printf("store close: %v", cerr)
+	}
+	if err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 func cmdRun(args []string) {
