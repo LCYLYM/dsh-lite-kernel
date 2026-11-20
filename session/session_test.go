@@ -111,6 +111,32 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	}
 }
 
+// A tool/result whose call was evicted by the budget must not be sent to
+// the model: strict providers reject orphaned tool messages.
+func TestBuildContextDropsOrphanToolResults(t *testing.T) {
+	dir := t.TempDir()
+	lg, _ := OpenLog(filepath.Join(dir, "s.jsonl"))
+	lg.Append("assistant/message", map[string]any{
+		"role": "assistant", "content": "calling",
+		"tool_calls": []map[string]any{{"id": "c1", "name": "read_file", "arguments": "{}"}},
+	})
+	for i := 0; i < 50; i++ {
+		lg.Append("user/message", map[string]any{"role": "user", "content": "filler"})
+	}
+	lg.Append("tool/result", map[string]any{"content": "file bytes", "tool_call_id": "c1"})
+	lg.Append("user/message", map[string]any{"role": "user", "content": "now what"})
+
+	msgs, err := BuildContext(lg, ContextBudget{MaxBytes: 1 << 20, MaxEvents: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			t.Fatalf("orphan tool result reached model context: %+v", m)
+		}
+	}
+}
+
 func TestReleaseReloads(t *testing.T) {
 	st, err := NewStore(t.TempDir())
 	if err != nil {
