@@ -109,3 +109,27 @@ func TestRetryMarkerSkipped(t *testing.T) {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
 	}
 }
+
+// A session file on disk must appear in List even before it is loaded
+// (upstream #13812: a healthy session vanished from the listing).
+func TestListIncludesPersistedSessions(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	st1, _ := NewStore(dataDir)
+	ses, err := st1.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second store has nothing live yet; the file must still list.
+	st2, _ := NewStore(dataDir)
+	found := false
+	for _, id := range st2.List() {
+		if id == ses.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("persisted session %s missing from List", ses.ID)
+	}
+}

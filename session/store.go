@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -101,13 +103,29 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
-// List returns live session ids (a lock-held snapshot, never a stale copy).
+// List returns every session the store can serve: live ones plus the
+// session-*.jsonl files on disk — a persisted session must be
+// discoverable before it is first loaded (upstream #13812: disk
+// enumeration silently dropped a healthy session).
 func (s *Store) List() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ids := make([]string, 0, len(s.live))
+	seen := map[string]bool{}
 	for id := range s.live {
+		seen[id] = true
+	}
+	entries, _ := os.ReadDir(s.dir)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "session-") || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		seen[strings.TrimSuffix(name, ".jsonl")] = true
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
 		ids = append(ids, id)
 	}
+	sort.Strings(ids)
 	return ids
 }
