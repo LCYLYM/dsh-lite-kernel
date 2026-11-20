@@ -215,10 +215,10 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 func envScrubbed(net bool) []string {
 	var out []string
 	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
+		name, val, _ := strings.Cut(kv, "=")
 		u := strings.ToUpper(name)
 		sensitive := false
-		if !benignShellConfig(u, net) {
+		if !benignShellConfig(u, val, net) {
 			for _, pat := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "PROXY"} {
 				if strings.Contains(u, pat) {
 					sensitive = true
@@ -233,14 +233,17 @@ func envScrubbed(net bool) []string {
 	return out
 }
 
-func benignShellConfig(u string, net bool) bool {
+func benignShellConfig(u, val string, net bool) bool {
 	for _, p := range []string{"GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"} {
 		if strings.HasPrefix(u, p) {
 			return true
 		}
 	}
 	if !net {
-		return false
+		// A file:// module mirror (or "off") works without the
+		// network and cannot carry remote credentials.
+		return u == "GOPROXY" &&
+			(strings.HasPrefix(val, "file://") || val == "off")
 	}
 	// Go module config selects mirrors and private-module rules;
 	// dropping GONOPROXY/GOPRIVATE while keeping GOPROXY sends

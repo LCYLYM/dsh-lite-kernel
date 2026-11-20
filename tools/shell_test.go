@@ -167,6 +167,19 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 		if strings.Contains(out, "GOPROXY=") {
 			t.Fatal("no-net sandbox kept GOPROXY credentials")
 		}
+		// A local file mirror still works without the network —
+		// it must survive the scrub.
+		t.Setenv("GOPROXY", "file:///root/gomodcache")
+		s0 := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second}
+		args0, _ := json.Marshal(map[string]string{"cmd": "env"})
+		raw0, err := s0.Call(context.Background(), args0)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if !strings.Contains(raw0.(map[string]any)["output"].(string), "GOPROXY=file://") {
+			t.Fatal("no-net sandbox dropped a local file:// GOPROXY")
+		}
+		t.Setenv("GOPROXY", "https://user:pass@goproxy.corp")
 		t.Setenv("DSHK_TEST_TOKEN_X", "leak-me")
 		s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second, AllowNet: true}
 		args, _ := json.Marshal(map[string]string{"cmd": "env"})
