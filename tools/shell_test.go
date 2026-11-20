@@ -145,6 +145,7 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 	t.Setenv("GIT_AUTHOR_NAME", "kernel-bot")
 	t.Setenv("GIT_TOKEN", "leak-me-three")
 	t.Setenv("GOPROXY", "https://user:pass@goproxy.corp")
+	t.Setenv("GONOPROXY", "corp.example.com")
 	res := shellCall(t, "env")
 	out := res["output"].(string)
 	for _, name := range []string{"DSHK_TEST_TOKEN_X", "DSHK_TEST_APIKEY", "DSHK_TEST_HTTPS_PROXY", "GIT_TOKEN"} {
@@ -177,6 +178,9 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 	}
 	if !strings.Contains(out, "GOPROXY=https://user:pass@goproxy.corp") {
 		t.Fatal("env scrub dropped GOPROXY from a networked command")
+	}
+	if !strings.Contains(out, "GONOPROXY=") {
+		t.Fatal("env scrub dropped GONOPROXY — private deps hit the mirror")
 	}
 }
 

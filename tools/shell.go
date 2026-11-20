@@ -239,7 +239,18 @@ func benignShellConfig(u string, net bool) bool {
 			return true
 		}
 	}
-	return net && u == "GOPROXY"
+	if !net {
+		return false
+	}
+	// Go module config selects mirrors and private-module rules;
+	// dropping GONOPROXY/GOPRIVATE while keeping GOPROXY sends
+	// private dependencies to the mirror and breaks the build.
+	for _, p := range []string{"GOPROXY", "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOFLAGS", "GOWORK"} {
+		if u == p {
+			return true
+		}
+	}
+	return false
 }
 
 func envWith(base []string, set map[string]string) []string {
