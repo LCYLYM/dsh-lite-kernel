@@ -42,8 +42,10 @@ func NewStore(dir string) (*Store, error) {
 	for _, e := range entries {
 		var n int64
 		var tail int
-		if k, _ := fmt.Sscanf(e.Name(), "session-%d-%d.jsonl", &n, &tail); k > 0 && n > maxSeq {
-			maxSeq = n
+		for _, pat := range []string{"session-%d.jsonl", "session-%d-%d.jsonl"} {
+			if k, _ := fmt.Sscanf(e.Name(), pat, &n, &tail); k > 0 && n > maxSeq {
+				maxSeq = n
+			}
 		}
 	}
 	st.seq = maxSeq
@@ -59,7 +61,9 @@ func (s *Store) Create(workspace string) (*Session, error) {
 
 func (s *Store) create(workspace string) (*Session, error) {
 	s.seq++
-	id := fmt.Sprintf("session-%d-%d", s.seq, len(s.live)+1)
+	// The seq alone is the id — seeded from disk at NewStore, so it is
+	// unique for the life of the data dir.
+	id := fmt.Sprintf("session-%d", s.seq)
 	path := filepath.Join(s.dir, id+".jsonl")
 	lg, err := OpenLog(path)
 	if err != nil {
