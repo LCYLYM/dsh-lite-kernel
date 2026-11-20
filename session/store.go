@@ -117,6 +117,9 @@ func (s *Store) List() []string {
 	entries, _ := os.ReadDir(s.dir)
 	for _, e := range entries {
 		name := e.Name()
+		if e.IsDir() {
+			continue
+		}
 		if !strings.HasPrefix(name, "session-") || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
