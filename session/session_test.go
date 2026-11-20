@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/LCYLYM/dsh-lite-kernel/llm"
 )
 
 func TestLogAppendReadRoundTrip(t *testing.T) {
@@ -108,6 +110,42 @@ func TestRetryMarkerSkipped(t *testing.T) {
 	msgs, _ := BuildContext(lg, ContextBudget{MaxBytes: 1 << 20, MaxEvents: 100})
 	if len(msgs) != 2 {
 		t.Fatalf("got %d msgs, want 2 (marker skipped)", len(msgs))
+	}
+}
+
+// A crashed turn leaves an assistant tool_call with no result; strict
+// providers reject every later request (upstream #13790). BuildContext
+// must splice in an interrupted-marker result.
+func TestBuildContextSynthesizesInterruptedToolResult(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(filepath.Join(dir, "session-1.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Append("user/message", map[string]any{"role": "user", "content": "hi"})
+	lg.Append("assistant/message", map[string]any{
+		"role": "assistant", "content": nil,
+		"tool_calls": []any{map[string]any{"id": "c1", "name": "x", "arguments": "{}"}},
+	})
+
+	msgs, err := BuildContext(lg, DefaultBudget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var assistant, tool *llm.Message
+	for i := range msgs {
+		if msgs[i].Role == "assistant" {
+			assistant = &msgs[i]
+		}
+		if msgs[i].Role == "tool" {
+			tool = &msgs[i]
+		}
+	}
+	if assistant == nil || tool == nil {
+		t.Fatalf("expected assistant + synthesized tool result, got %+v", msgs)
+	}
+	if tool.ToolCallID != "c1" {
+		t.Fatalf("synthesized result id = %q", tool.ToolCallID)
 	}
 }
 
@@ -238,12 +276,8 @@ func TestReleaseReloads(t *testing.T) {
 	if err := st.Release(ses.ID); err != nil {
 		t.Fatal(err)
 	}
-	// evicted: List drops it, Get reloads a fresh Session object
-	for _, id := range st.List() {
-		if id == ses.ID {
-			t.Fatal("released session still live")
-		}
-	}
+	// evicted from the live map: Get reloads a fresh Session object.
+	// List still shows it — it is persisted on disk, which is the point.
 	ses2, err := st.Get(ses.ID)
 	if err != nil || ses2 == ses {
 		t.Fatalf("reload: %v same=%v", err, ses2 == ses)

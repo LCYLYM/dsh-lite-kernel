@@ -141,25 +141,84 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		count++
 		rev = append(rev, m)
 	}
+	// A turn that crashed between the assistant tool_call and its
+	// tool/result leaves a dangling call in the log; strict providers
+	// require a result per call and would reject every later request,
+	// bricking the session (upstream #13790). Synthesize an
+	// interrupted-marker result directly after the call, bounded by a
+	// small synthesis reserve; a call that would not fit is dropped
+	// from the message instead so the request stays valid.
+	results := map[string]bool{}
+	for _, m := range rev {
+		if m.Role == "tool" {
+			results[m.ToolCallID] = true
+		}
+	}
+	// The synthesis reserve is only the budget history did not spend:
+	// history + synthesized results together stay within both limits.
+	synthBytes, synthCount := 0, 0
+	synthByteCap := b.MaxBytes - used
+	if synthByteCap > 64<<10 {
+		synthByteCap = 64 << 10
+	}
+	if synthByteCap < 0 {
+		synthByteCap = 0
+	}
+	synthMax := b.MaxEvents - count
+	if synthMax < 0 {
+		synthMax = 0
+	}
+	// rev is newest→oldest; emit oldest→newest, synthesizing a result for
+	// every tool call the log never answered (#13790).
+	var filtered []llm.Message
+	for i := len(rev) - 1; i >= 0; i-- {
+		m := rev[i]
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			filtered = append(filtered, m)
+			continue
+		}
+		var keptCalls []llm.ToolCall
+		var synths []llm.Message
+		for _, tc := range m.ToolCalls {
+			if results[tc.ID] {
+				keptCalls = append(keptCalls, tc)
+				continue
+			}
+			est := len(tc.ID) + 128
+			if synthBytes+est > synthByteCap || synthCount+1 > synthMax {
+				continue // drop the call rather than exceed the reserve
+			}
+			synthBytes += est
+			synthCount++
+			synths = append(synths, llm.Message{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    "[tool call was interrupted before it produced a result]",
+			})
+			keptCalls = append(keptCalls, tc)
+		}
+		m.ToolCalls = keptCalls
+		if len(keptCalls) == 0 && m.Content == nil {
+			continue // an empty assistant carries nothing the model needs
+		}
+		filtered = append(filtered, m)
+		filtered = append(filtered, synths...)
+	}
 	// A backward scan can cut between an assistant tool_call and its
 	// tool/result (the result is newer, so it survives while the call is
 	// evicted). An orphaned tool message hard-fails strict providers, so
 	// drop results whose call is not in the window.
 	ids := map[string]bool{}
-	for _, m := range rev {
+	for _, m := range filtered {
 		for _, tc := range m.ToolCalls {
 			ids[tc.ID] = true
 		}
 	}
-	kept := rev[:0]
-	for _, m := range rev {
+	for _, m := range filtered {
 		if m.Role == "tool" && !ids[m.ToolCallID] {
 			continue
 		}
-		kept = append(kept, m)
-	}
-	for i := len(kept) - 1; i >= 0; i-- {
-		msgs = append(msgs, kept[i])
+		msgs = append(msgs, m)
 	}
 	sys := b.SystemText
 	if comp != nil {
