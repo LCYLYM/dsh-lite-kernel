@@ -79,7 +79,11 @@ func cmdAPI(name string, args []string) {
 			log.Fatal(err)
 		}
 		defer res.Body.Close()
-		io.Copy(os.Stdout, res.Body)
+		if _, err := io.Copy(os.Stdout, res.Body); err != nil {
+			// A truncated body must not exit zero — scripts would
+			// consume partial JSON and report success.
+			log.Fatalf("reading response: %v", err)
+		}
 		if res.StatusCode >= 400 {
 			os.Exit(1)
 		}
