@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,12 +84,35 @@ func (t ReadFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(p)
+	// Check size before reading: allocating the file first and
+	// rejecting it afterward defeats the point of the cap — a huge
+	// file would still grow the heap to its full size.
+	// Stat before Open: opening a fifo blocks until a writer appears,
+	// so the non-regular check must come first.
+	fi, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("tools: %q is not a regular file", a.Path)
+	}
+	if fi.Size() > 1<<20 {
+		return map[string]any{"error": "file exceeds 1 MiB read cap", "bytes": fi.Size()}, nil
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// The +1 byte distinguishes "exactly at cap" from "grew past the
+	// stat": a file that expanded or under-reported its size still
+	// returns the cap error rather than silent truncation.
+	b, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
 	if err != nil {
 		return nil, err
 	}
 	if len(b) > 1<<20 {
-		return map[string]any{"error": "file exceeds 1 MiB read cap", "bytes": len(b)}, nil
+		return map[string]any{"error": "file exceeds 1 MiB read cap"}, nil
 	}
 	return string(b), nil
 }

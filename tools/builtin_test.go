@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -84,5 +85,36 @@ func TestWriteThenRead(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(dir, "a", "b.txt"))
 	if err != nil || string(b) != "hello" {
 		t.Fatalf("got %q err %v", b, err)
+	}
+}
+
+// An oversized file is rejected from its size metadata — the heap never
+// sees its contents.
+func TestReadFileOversize(t *testing.T) {
+	dir := t.TempDir()
+	big := filepath.Join(dir, "big.bin")
+	if err := os.WriteFile(big, make([]byte, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := (ReadFile{W: Workspace{Root: dir}}).Call(context.Background(),
+		json.RawMessage(`{"path":"big.bin"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := out.(map[string]any)
+	if !ok || m["error"] == nil {
+		t.Fatalf("expected cap error, got %v", out)
+	}
+}
+
+func TestReadFileRejectsFifo(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (ReadFile{W: Workspace{Root: dir}}).Call(context.Background(),
+		json.RawMessage(`{"path":"pipe"}`)); err == nil {
+		t.Fatal("expected non-regular file error")
 	}
 }
