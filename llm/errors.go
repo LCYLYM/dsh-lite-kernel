@@ -14,13 +14,13 @@ import (
 type Kind int
 
 const (
-	KindUnknown Kind = iota
-	KindTransient     // network resets, EOF, 5xx — always retryable
-	KindRateLimit     // 429 / throttling — retryable, honor Retry-After
-	KindQuota         // plan balance exhausted — not retryable
-	KindInvalid       // 4xx request errors — not retryable
-	KindTimeout       // deadline exceeded — retryable
-	KindContentFilter // upstream moderation — not retryable
+	KindUnknown       Kind = iota
+	KindTransient          // network resets, EOF, 5xx — always retryable
+	KindRateLimit          // 429 / throttling — retryable, honor Retry-After
+	KindQuota              // plan balance exhausted — not retryable
+	KindInvalid            // 4xx request errors — not retryable
+	KindTimeout            // deadline exceeded — retryable
+	KindContentFilter      // upstream moderation — not retryable
 )
 
 // CallError is a classified provider failure.
