@@ -105,14 +105,19 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 			results[m.ToolCallID] = true
 		}
 	}
+	// The synthesis reserve is only the budget history did not spend:
+	// history + synthesized results together stay within both limits.
 	synthBytes, synthCount := 0, 0
-	synthByteCap := b.MaxBytes / 4
+	synthByteCap := b.MaxBytes - used
 	if synthByteCap > 64<<10 {
 		synthByteCap = 64 << 10
 	}
-	synthMax := b.MaxEvents / 4
-	if synthMax < 4 {
-		synthMax = 4
+	if synthByteCap < 0 {
+		synthByteCap = 0
+	}
+	synthMax := b.MaxEvents - count
+	if synthMax < 0 {
+		synthMax = 0
 	}
 	for i := len(rev) - 1; i >= 0; i-- {
 		m := rev[i]
