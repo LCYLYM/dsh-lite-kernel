@@ -78,19 +78,24 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	wsRoot, err := filepath.Abs(t.W.Root)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
 	}
-	if err := writeAtomic(p, []byte(a.Content)); err != nil {
+	if err := writeAtomic(p, wsRoot, []byte(a.Content)); err != nil {
 		return nil, err
 	}
 	return map[string]any{"path": p}, nil
 }
 
 // writeAtomic stages the content in a sibling temp file, fsyncs it,
-// renames over the target, and fsyncs the directory — an acknowledged
-// write survives a host crash, and two writers never share a temp name.
-func writeAtomic(path string, data []byte) error {
+// renames over the target, and fsyncs every directory between the file
+// and wsRoot so freshly created path components survive a host crash
+// too. Two writers never share a temp name.
+func writeAtomic(path, wsRoot string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
@@ -111,9 +116,23 @@ func writeAtomic(path string, data []byte) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = d.Sync()
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		d, err := os.Open(dir)
+		if err != nil {
+			return fmt.Errorf("tools: sync dir %q: %w", dir, err)
+		}
+		err = d.Sync()
 		d.Close()
+		if err != nil {
+			return fmt.Errorf("tools: sync dir %q: %w", dir, err)
+		}
+		if dir == wsRoot {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
 	}
 	return nil
 }
