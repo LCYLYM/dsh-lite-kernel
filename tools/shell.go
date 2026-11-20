@@ -202,17 +202,19 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 // variables — names carrying KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL,
 // AUTH or PROXY (proxy URLs embed user:pass) — so a shell command
 // cannot exfiltrate daemon credentials through its logged output.
-// GIT_* names are exempt: they are git's own configuration namespace
-// (GIT_AUTHOR_NAME, GIT_CONFIG_KEY_*), not daemon credentials, and
-// stripping them breaks the shell's git while leaving GIT_CONFIG_COUNT
-// pointing at keys that no longer exist.
+// Toolchain config that only looks credential-shaped is exempt:
+// GIT_AUTHOR_*/GIT_COMMITTER_*/GIT_CONFIG_* are the shell git's own
+// settings (stripping them breaks commits, and dropping the keys while
+// GIT_CONFIG_COUNT survives corrupts env-based config), and GOPROXY
+// selects the module mirror builds fetch through. Any other GIT_*
+// name — GIT_TOKEN and friends — stays scrub-checked.
 func envScrubbed() []string {
 	var out []string
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
 		u := strings.ToUpper(name)
 		sensitive := false
-		if !strings.HasPrefix(u, "GIT_") {
+		if !benignShellConfig(u) {
 			for _, pat := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "PROXY"} {
 				if strings.Contains(u, pat) {
 					sensitive = true
@@ -225,6 +227,15 @@ func envScrubbed() []string {
 		}
 	}
 	return out
+}
+
+func benignShellConfig(u string) bool {
+	for _, p := range []string{"GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"} {
+		if strings.HasPrefix(u, p) {
+			return true
+		}
+	}
+	return u == "GOPROXY"
 }
 
 func envWith(base []string, set map[string]string) []string {

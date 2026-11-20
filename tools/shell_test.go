@@ -143,9 +143,11 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 	t.Setenv("DSHK_TEST_APIKEY", "leak-me-too")
 	t.Setenv("DSHK_TEST_HTTPS_PROXY", "http://user:pass@proxy:8080")
 	t.Setenv("GIT_AUTHOR_NAME", "kernel-bot")
+	t.Setenv("GIT_TOKEN", "leak-me-three")
+	t.Setenv("GOPROXY", "https://user:pass@goproxy.corp")
 	res := shellCall(t, "env")
 	out := res["output"].(string)
-	for _, name := range []string{"DSHK_TEST_TOKEN_X", "DSHK_TEST_APIKEY", "DSHK_TEST_HTTPS_PROXY"} {
+	for _, name := range []string{"DSHK_TEST_TOKEN_X", "DSHK_TEST_APIKEY", "DSHK_TEST_HTTPS_PROXY", "GIT_TOKEN"} {
 		if strings.Contains(out, name) {
 			t.Fatalf("credential %s leaked into shell env: %v", name, out)
 		}
@@ -155,6 +157,9 @@ func TestShellScrubsDaemonCredentials(t *testing.T) {
 	}
 	if !strings.Contains(out, "GIT_AUTHOR_NAME=kernel-bot") {
 		t.Fatal("env scrub stripped git's own config namespace")
+	}
+	if !strings.Contains(out, "GOPROXY=https://user:pass@goproxy.corp") {
+		t.Fatal("env scrub dropped GOPROXY — builds cannot fetch modules")
 	}
 }
 
