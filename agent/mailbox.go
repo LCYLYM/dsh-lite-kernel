@@ -22,6 +22,10 @@ type Notice struct {
 	From    string          `json:"from"`
 	Kind    string          `json:"kind"`
 	Payload json.RawMessage `json:"payload"`
+	// Wake opts out of waking an idle recipient: nil (or true) wakes it,
+	// false enqueues for the next turn instead — an aborted/cancelled
+	// outcome must not re-trigger the model it just stopped (#13859).
+	Wake *bool `json:"wake,omitempty"`
 }
 
 type deliveredData struct {
@@ -60,10 +64,30 @@ func Pending(lg *session.Log) ([]Notice, error) {
 				delivered[d.ID] = true
 				pending = filterOut(pending, d.ID)
 			}
+		case "mailbox/undeliver":
+			var u struct {
+				Notice Notice `json:"notice"`
+			}
+			if json.Unmarshal(ev.Data, &u) == nil {
+				delivered[u.Notice.ID] = false
+				pending = append(pending, u.Notice)
+			}
 		}
 		return true
 	})
 	return pending, err
+}
+
+// HasPending reports whether undelivered notices wait in the mailbox.
+// The cheap incremental scan runs first so notices appended since the
+// last drain count too — a notice posted during the final provider
+// call must not look like an empty mailbox.
+func HasPending(lg *session.Log) bool {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	_ = mb.scan(lg)
+	return len(mb.pending) > 0
 }
 
 func pendingSet(ns []Notice) map[string]bool {
@@ -94,6 +118,7 @@ type mailboxState struct {
 	scanned   int64
 	delivered map[string]bool
 	pending   map[string]Notice
+	injected  []Notice // injected this turn, awaiting its outcome
 }
 
 // maxDrainBatch caps one drain's injection well below any plausible
@@ -115,15 +140,9 @@ func mailboxFor(lg *session.Log) *mailboxState {
 	return m.(*mailboxState)
 }
 
-// Drain scans new log events for notices, injects every pending one
-// into the model-visible stream, then acknowledges. The inject event
-// lands BEFORE the acknowledgements: a crash between them replays the
-// notice as a duplicate (deduped for the model by BuildContext), never
-// a silent loss.
-func Drain(lg *session.Log) error {
-	mb := mailboxFor(lg)
-	mb.mu.Lock()
-	defer mb.mu.Unlock()
+// scan advances the notice index over events appended since the last
+// call — O(new events), never O(history). Call with mb.mu held.
+func (mb *mailboxState) scan(lg *session.Log) error {
 	last := mb.scanned
 	err := lg.ReadFrom(mb.scanned, func(ev session.Event) bool {
 		last = ev.Seq
@@ -139,6 +158,14 @@ func Drain(lg *session.Log) error {
 				delete(mb.pending, d.ID)
 				mb.delivered[d.ID] = true
 			}
+		case "mailbox/undeliver":
+			var u struct {
+				Notice Notice `json:"notice"`
+			}
+			if json.Unmarshal(ev.Data, &u) == nil {
+				delete(mb.delivered, u.Notice.ID)
+				mb.pending[u.Notice.ID] = u.Notice
+			}
 		}
 		return true
 	})
@@ -146,6 +173,21 @@ func Drain(lg *session.Log) error {
 		return err
 	}
 	mb.scanned = last
+	return nil
+}
+
+// Drain scans new log events for notices, injects every pending one
+// into the model-visible stream, then acknowledges. The inject event
+// lands BEFORE the acknowledgements: a crash between them replays the
+// notice as a duplicate (deduped for the model by BuildContext), never
+// a silent loss.
+func Drain(lg *session.Log) error {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if err := mb.scan(lg); err != nil {
+		return err
+	}
 	if len(mb.pending) == 0 {
 		return nil
 	}
@@ -168,11 +210,35 @@ func Drain(lg *session.Log) error {
 		return err
 	}
 	for _, id := range ids {
+		n := mb.pending[id]
 		if err := Delivered(lg, id); err != nil {
 			return err
 		}
 		delete(mb.pending, id)
 		mb.delivered[id] = true
+		mb.injected = append(mb.injected, n)
 	}
 	return nil
+}
+
+// turnOutcome resolves the notices a drive injected. A turn that fails
+// after acking would otherwise swallow them — the inject sits in the
+// log while nothing ever delivers it again. On failure each one is
+// re-pended AND a mailbox/undeliver record lands in the log so the
+// index rebuilds identically after a restart. Call with the drive's
+// final error; nil just clears the batch.
+func turnOutcome(lg *session.Log, err error) {
+	mb := mailboxFor(lg)
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if err == nil {
+		mb.injected = nil
+		return
+	}
+	for _, n := range mb.injected {
+		delete(mb.delivered, n.ID)
+		mb.pending[n.ID] = n
+		lg.Append("mailbox/undeliver", map[string]any{"notice": n})
+	}
+	mb.injected = nil
 }

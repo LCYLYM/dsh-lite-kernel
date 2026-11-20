@@ -543,3 +543,29 @@ func TestIDlessNoticesAllRendered(t *testing.T) {
 		t.Fatalf("id-less notices collapsed: %d rendered", found)
 	}
 }
+
+type failProvider struct{ err error }
+
+func (p *failProvider) Complete(ctx context.Context, r *llm.Request) (*llm.Response, error) {
+	return nil, p.err
+}
+
+// A turn that fails after Drain acked its notices must not swallow
+// them: turnOutcome re-pends each injected notice and leaves a durable
+// mailbox/undeliver record, so a fresh index also sees it pending.
+func TestFailedTurnRependersNotices(t *testing.T) {
+	loop, lg := newLoop(t, &failProvider{err: errors.New("provider down")})
+	if err := Post(lg, Notice{ID: "n-f", From: "c", Kind: "done", Payload: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loop.Run(context.Background(), "hi"); err == nil {
+		t.Fatal("expected failure")
+	}
+	if !HasPending(lg) {
+		t.Fatal("notice swallowed by failed turn")
+	}
+	// undeliver is durable: a fresh index sees it pending too
+	if ps, _ := Pending(lg); len(ps) != 1 || ps[0].ID != "n-f" {
+		t.Fatalf("pending %v", ps)
+	}
+}

@@ -91,6 +91,42 @@ func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
 			state, err = l.drive(ctx)
 		}
 	}
+	return l.settle(ctx, state, err)
+}
+
+// maxWakeDrives bounds how many back-to-back drives a turn may run
+// while consuming a flooded mailbox — a notice storm must not starve
+// the caller forever; the remainder stays pending for the next wake.
+const maxWakeDrives = 8
+
+// settle re-drives while notices remain pending — a notice posted
+// during the final provider call never saw a drain, and a batch over
+// the cap leaves the rest undelivered. Called with turnMu held.
+func (l *Loop) settle(ctx context.Context, state TurnState, err error) (TurnState, error) {
+	for i := 0; i < maxWakeDrives && err == nil && HasPending(l.Log); i++ {
+		state, err = l.drive(ctx)
+	}
+	return state, err
+}
+
+// Resume wakes an idle session without a user message — a mailbox
+// notice delivered to a session with no turn in flight triggers it.
+// The injected notice is the model-visible input, so the turn still
+// reconstructs from the log. Returns ErrTurnBusy when a turn is
+// already running (that turn's own drain picks the notice up).
+func (l *Loop) Resume(ctx context.Context) (TurnState, error) {
+	if !l.turnMu.TryLock() {
+		return Failed, ErrTurnBusy
+	}
+	state, err := l.settle(ctx, Completed, nil)
+	l.turnMu.Unlock()
+	// A notice posted between the last drain and the unlock gets one
+	// more attempt: losing the re-acquire means a new owner took over
+	// and performs this same check at the end of its turn.
+	if err == nil && HasPending(l.Log) && l.turnMu.TryLock() {
+		state, err = l.settle(ctx, state, err)
+		l.turnMu.Unlock()
+	}
 	return state, err
 }
 
@@ -98,7 +134,8 @@ func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
 // assistant output is committed with truncated=true, so the next request
 // carries the partial output plus a continue hint — never a stateless
 // re-run (#13647).
-func (l *Loop) drive(ctx context.Context) (TurnState, error) {
+func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
+	defer func() { turnOutcome(l.Log, err) }()
 	zeroTool := 0
 	resumedFromTrunc := false
 	for step := 0; step < l.Guard.MaxSteps; step++ {
