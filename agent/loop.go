@@ -75,6 +75,14 @@ func (l *Loop) Busy() bool {
 // same log would interleave events (user B's message landing mid-turn A)
 // — the second caller gets ErrTurnBusy, a caller-visible rejection rather
 // than a silently corrupted history.
+// append writes a durable event; failures are fatal to the turn — a
+// turn that keeps running past a lost write diverges from the record
+// the next request is reconstructed from (model-visible ⟺ logged).
+func (l *Loop) append(typ string, data any) error {
+	_, err := l.Log.Append(typ, data)
+	return err
+}
+
 func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
 	if !l.turnMu.TryLock() {
 		return Failed, ErrTurnBusy
@@ -94,9 +102,11 @@ func (l *Loop) Run(ctx context.Context, userText string) (TurnState, error) {
 		for i := 0; i < max && state == Waiting; i++ {
 			// Exponential wait before re-driving; the attempt is logged so
 			// an idle session is never a silent one (#13621).
-			l.Log.Append("session/waiting", map[string]any{
+			if err := l.append("session/waiting", map[string]any{
 				"resume_in_seconds": 30 * (1 << i), "attempt": i + 1,
-			})
+			}); err != nil {
+				return Failed, err
+			}
 			select {
 			case <-ctx.Done():
 				return Waiting, ctx.Err()
@@ -162,10 +172,12 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 				return Failed, fmt.Errorf("agent: usage accounting: %w", uerr)
 			}
 			if u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
-				l.Log.Append("turn/end", map[string]any{
+				if err := l.append("turn/end", map[string]any{
 					"reason": "aborted",
 					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
-				})
+				}); err != nil {
+					return Failed, err
+				}
 				return Aborted, errors.New("agent: session token budget exceeded")
 			}
 		}
@@ -180,7 +192,9 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 		// cannot fit the budget, fold history before it happens again
 		// (deterministic — no model call, no route to misconfigure).
 		if l.shouldCompact(msgs) {
-			l.compact()
+			if err := l.compact(); err != nil {
+				return Failed, err
+			}
 			if msgs, err = session.BuildContext(l.Log, l.Budget); err != nil {
 				return Failed, err
 			}
@@ -240,10 +254,14 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 			// Retry budget spent → Waiting is an explicit, logged state.
 			var ce *llm.CallError
 			if llm.AsCallError(err, &ce) && ce.Retryable() {
-				l.Log.Append("turn/end", map[string]any{"reason": "waiting", "error": ce.Message})
+				if err := l.append("turn/end", map[string]any{"reason": "waiting", "error": ce.Message}); err != nil {
+					return Failed, err
+				}
 				return Waiting, err
 			}
-			l.Log.Append("turn/end", map[string]any{"reason": "error", "error": err.Error()})
+			if aerr := l.append("turn/end", map[string]any{"reason": "error", "error": err.Error()}); aerr != nil {
+				return Failed, aerr
+			}
 			return Failed, err
 		}
 
@@ -261,7 +279,9 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 			ev["prompt_tokens"] = resp.Usage.InputTokens
 			ev["completion_tokens"] = resp.Usage.OutputTokens
 		}
-		l.Log.Append("assistant/message", ev)
+		if err := l.append("assistant/message", ev); err != nil {
+			return Failed, err
+		}
 
 		// Crossing the cap aborts before tool side effects — this
 		// step's tool calls do not run. Same ordering as the guards.
@@ -271,23 +291,29 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 				return Failed, fmt.Errorf("agent: usage accounting: %w", uerr)
 			}
 			if u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
-				l.Log.Append("turn/end", map[string]any{
+				if err := l.append("turn/end", map[string]any{
 					"reason": "aborted",
 					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
-				})
+				}); err != nil {
+					return Failed, err
+				}
 				return Aborted, errors.New("agent: session token budget exceeded")
 			}
 		}
 
 		// Guard: repetition / no-progress / caps.
 		if abort, why := l.Guard.CheckStep(text, len(resp.Message.ToolCalls)); abort {
-			l.Log.Append("turn/end", map[string]any{"reason": "aborted", "detail": why})
+			if err := l.append("turn/end", map[string]any{"reason": "aborted", "detail": why}); err != nil {
+				return Failed, err
+			}
 			return Aborted, errors.New("agent: " + why)
 		}
 		if len(resp.Message.ToolCalls) == 0 {
 			zeroTool++
 			if zeroTool >= l.Guard.MaxZeroToolSteps && !resumedFromTrunc {
-				l.Log.Append("turn/end", map[string]any{"reason": "completed", "detail": "no tool calls"})
+				if err := l.append("turn/end", map[string]any{"reason": "completed", "detail": "no tool calls"}); err != nil {
+					return Failed, err
+				}
 				return Completed, nil
 			}
 		} else {
@@ -302,40 +328,54 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 			// history makes strict providers reject every later request.
 			if err := ctx.Err(); err != nil {
 				cancelled = true
-				l.Log.Append("tool/result", map[string]any{
+				if err := l.append("tool/result", map[string]any{
 					"tool_call_id": tc.ID, "name": tc.Name,
 					"content": map[string]any{"error": "cancelled before execution"}, "error": true,
-				})
+				}); err != nil {
+					return Failed, err
+				}
 				continue
 			}
-			l.Log.Append("tool/call", map[string]any{"id": tc.ID, "name": tc.Name})
+			if err := l.append("tool/call", map[string]any{"id": tc.ID, "name": tc.Name}); err != nil {
+				return Failed, err
+			}
 			out, terr := l.Registry.Call(ctx, tc)
 			if terr != nil {
 				out = map[string]any{"error": terr.Error()}
 			}
 			out = l.capResult(out)
-			l.Log.Append("tool/result", map[string]any{
+			if err := l.append("tool/result", map[string]any{
 				"tool_call_id": tc.ID, "name": tc.Name, "content": out, "error": terr != nil,
-			})
+			}); err != nil {
+				return Failed, err
+			}
 		}
 		if cancelled {
-			l.Log.Append("turn/end", map[string]any{"reason": "cancelled", "error": ctx.Err().Error()})
+			if err := l.append("turn/end", map[string]any{"reason": "cancelled", "error": ctx.Err().Error()}); err != nil {
+				return Failed, err
+			}
 			return Aborted, ctx.Err()
 		}
 
 		if truncated {
 			resumedFromTrunc = true
-			l.Log.Append("user/message", map[string]any{
+			if err := l.append("user/message", map[string]any{
 				"role": "user", "content": "Continue from where the output was cut off; do not restart.",
-			})
+			}); err != nil {
+				return Failed, err
+			}
 			continue
 		}
 		if len(resp.Message.ToolCalls) == 0 {
-			l.Log.Append("turn/end", map[string]any{"reason": "completed"})
+			if err := l.append("turn/end", map[string]any{"reason": "completed"}); err != nil {
+				return Failed, err
+			}
 			return Completed, nil
 		}
 	}
-	l.Log.Append("turn/end", map[string]any{"reason": "aborted", "detail": "MaxSteps exceeded"})
+	if err := l.append("turn/end", map[string]any{"reason": "aborted", "detail": "MaxSteps exceeded"}); err != nil {
+		return Failed, err
+	}
 	return Aborted, errors.New("agent: step budget exhausted")
 }
 
@@ -391,11 +431,18 @@ func (l *Loop) shouldCompact(msgs []llm.Message) bool {
 	return l.Log.Len()-l.Log.CompactedThrough() > window
 }
 
-func (l *Loop) compact() {
+func (l *Loop) compact() error {
 	through := l.Log.Len() - int64(l.Budget.MaxEvents)
 	if err := session.Compact(l.Log, through); err != nil {
-		l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()})
+		// Best effort: a failed marker write must not mask the original
+		// compaction error — and the marker itself is a durable write,
+		// so a failed append ends the turn like every other one.
+		if _, aerr := l.Log.Append("session/compaction-error", map[string]any{"error": err.Error()}); aerr != nil {
+			return aerr
+		}
+		return err
 	}
+	return nil
 }
 
 // streamStep runs one model call through Streamer, logging throttled
@@ -407,7 +454,10 @@ func (l *Loop) streamStep(ctx context.Context, st llm.Streamer, req *llm.Request
 		if pending.Len() == 0 {
 			return
 		}
-		l.Log.Append("assistant/delta", map[string]any{"text": pending.String()})
+		// Progress metadata only — BuildContext never reconstructs
+		// deltas, so a dropped write is worth nothing more than a
+		// missing progress tick.
+		_, _ = l.Log.Append("assistant/delta", map[string]any{"text": pending.String()})
 		pending.Reset()
 	}
 	resp, err := st.Stream(ctx, req, func(d llm.Delta) error {
@@ -419,7 +469,7 @@ func (l *Loop) streamStep(ctx context.Context, st llm.Streamer, req *llm.Request
 		}
 		if d.ToolName != "" {
 			flush()
-			l.Log.Append("assistant/tool-intent", map[string]any{"name": d.ToolName, "index": d.CallIndex})
+			_, _ = l.Log.Append("assistant/tool-intent", map[string]any{"name": d.ToolName, "index": d.CallIndex})
 		}
 		return ctx.Err()
 	})
