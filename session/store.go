@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Session is a durable conversation: a log plus metadata.
@@ -53,10 +54,13 @@ func (s *Store) create(workspace string) (*Session, error) {
 	// Workspace is durable: it rides in the log so a session reloaded
 	// from disk (after restart or eviction) keeps its binding. Not
 	// model-visible — BuildContext skips event types it does not know.
-	if _, err := lg.Append("session/meta", map[string]any{"workspace": workspace}); err != nil {
+	now := time.Now().Unix()
+	if _, err := lg.Append("session/meta", map[string]any{
+		"workspace": workspace, "created_at": now,
+	}); err != nil {
 		return nil, err
 	}
-	ses := &Session{ID: id, Workspace: workspace, Log: lg}
+	ses := &Session{ID: id, Workspace: workspace, Log: lg, CreatedAt: now}
 	s.live[id] = ses
 	return ses, nil
 }
@@ -104,19 +108,22 @@ func (s *Store) Get(id string) (*Session, error) {
 		return nil, err
 	}
 	var ws string
+	var at int64
 	_ = lg.ReadFrom(0, func(ev Event) bool {
 		if ev.Type != "session/meta" {
 			return true
 		}
 		var m struct {
 			Workspace string `json:"workspace"`
+			CreatedAt int64  `json:"created_at"`
 		}
 		if json.Unmarshal(ev.Data, &m) == nil {
 			ws = m.Workspace
+			at = m.CreatedAt
 		}
 		return false
 	})
-	ses := &Session{ID: id, Workspace: ws, Log: lg}
+	ses := &Session{ID: id, Workspace: ws, Log: lg, CreatedAt: at}
 	s.live[id] = ses
 	return ses, nil
 }

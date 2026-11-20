@@ -127,4 +127,7 @@ func TestWorkspaceSurvivesReload(t *testing.T) {
 	if got.Workspace != "/srv/ws-a" {
 		t.Fatalf("workspace lost on reload: %q", got.Workspace)
 	}
+	if got.CreatedAt == 0 {
+		t.Fatal("created_at not persisted")
+	}
 }
