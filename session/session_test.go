@@ -150,3 +150,15 @@ func TestReplayDoesNotBlockAppends(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTailZeroReturnsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	lg, err := OpenLog(filepath.Join(dir, "s.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Append("user/message", map[string]any{"role": "user", "content": "x"})
+	if evs, err := lg.Tail(0); err != nil || len(evs) != 0 {
+		t.Fatalf("Tail(0) = %v, %v", evs, err)
+	}
+}

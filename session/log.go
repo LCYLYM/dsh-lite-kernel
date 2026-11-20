@@ -114,7 +114,11 @@ func (l *Log) ReadFrom(after int64, fn func(Event) bool) error {
 		return nil
 	}
 	off := l.offsets[after]
+	fi, statErr := l.f.Stat()
 	l.mu.Unlock()
+	if statErr != nil {
+		return statErr
+	}
 
 	f, err := os.Open(l.path)
 	if err != nil {
@@ -124,7 +128,11 @@ func (l *Log) ReadFrom(after int64, fn func(Event) bool) error {
 	if _, err := f.Seek(off, 0); err != nil {
 		return err
 	}
-	return readEvents(bufio.NewReaderSize(f, 1<<20), fn)
+	// Bound the scan at the snapshot end: events appended mid-replay
+	// belong to the live channel, not to this replay — streaming them
+	// twice produced duplicate ids at the replay/live seam.
+	r := bufio.NewReaderSize(io.LimitReader(f, fi.Size()-off), 1<<20)
+	return readEvents(r, fn)
 }
 
 func readEvents(r *bufio.Reader, fn func(Event) bool) error {
@@ -149,6 +157,9 @@ func readEvents(r *bufio.Reader, fn func(Event) bool) error {
 
 // Tail returns up to n trailing events — O(n), no full scan.
 func (l *Log) Tail(n int) ([]Event, error) {
+	if n <= 0 {
+		return nil, nil
+	}
 	l.mu.Lock()
 	if l.nextSeq <= 1 {
 		l.mu.Unlock()
@@ -159,7 +170,11 @@ func (l *Log) Tail(n int) ([]Event, error) {
 		start = 0
 	}
 	off := l.offsets[start]
+	fi, statErr := l.f.Stat()
 	l.mu.Unlock()
+	if statErr != nil {
+		return nil, statErr
+	}
 
 	f, err := os.Open(l.path)
 	if err != nil {
@@ -170,7 +185,8 @@ func (l *Log) Tail(n int) ([]Event, error) {
 		return nil, err
 	}
 	var out []Event
-	err = readEvents(bufio.NewReaderSize(f, 1<<20), func(ev Event) bool {
+	r := bufio.NewReaderSize(io.LimitReader(f, fi.Size()-off), 1<<20)
+	err = readEvents(r, func(ev Event) bool {
 		out = append(out, ev)
 		return true
 	})
