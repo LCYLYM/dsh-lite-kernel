@@ -1,6 +1,9 @@
 package session
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sync"
+)
 
 // UsageTotal is the summed token spend of a session, aggregated from
 // usage fields on assistant/message events — accounting rides the same
@@ -11,12 +14,38 @@ type UsageTotal struct {
 	Steps        int `json:"steps"` // model calls with reported usage
 }
 
-// Usage sums turn/usage events — O(log), only over the offset index.
-// The read error propagates: a partial total must never pass for a
-// complete accounting (billing, budget checks).
+// usageState is the per-log aggregate: rebuilt once on first call,
+// then advanced only over events appended since the last scan — the
+// same shape as the mailbox index. drive() budgets every step against
+// Usage, so a full reread would cost O(steps × history) — on a long
+// session that is hundreds of megabytes of IO per turn.
+type usageState struct {
+	mu      sync.Mutex
+	scanned int64
+	u       UsageTotal
+}
+
+var usages sync.Map // *Log -> *usageState
+
+func usageFor(lg *Log) *usageState {
+	st, loaded := usages.LoadOrStore(lg, &usageState{})
+	if !loaded {
+		// The index must not root a closed log forever.
+		lg.OnClose(func() { usages.Delete(lg) })
+	}
+	return st.(*usageState)
+}
+
+// Usage sums the usage fields on assistant/message events. The read
+// error propagates without advancing the index: a partial total must
+// never pass for a complete accounting (billing, budget checks).
 func Usage(lg *Log) (UsageTotal, error) {
-	var u UsageTotal
-	err := lg.ReadFrom(0, func(ev Event) bool {
+	st := usageFor(lg)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	last := st.scanned
+	err := lg.ReadFrom(st.scanned, func(ev Event) bool {
+		last = ev.Seq
 		if ev.Type != "assistant/message" {
 			return true
 		}
@@ -25,11 +54,15 @@ func Usage(lg *Log) (UsageTotal, error) {
 			Completion int `json:"completion_tokens"`
 		}
 		if json.Unmarshal(ev.Data, &t) == nil && (t.Prompt > 0 || t.Completion > 0) {
-			u.InputTokens += t.Prompt
-			u.OutputTokens += t.Completion
-			u.Steps++
+			st.u.InputTokens += t.Prompt
+			st.u.OutputTokens += t.Completion
+			st.u.Steps++
 		}
 		return true
 	})
-	return u, err
+	if err != nil {
+		return UsageTotal{}, err
+	}
+	st.scanned = last
+	return st.u, nil
 }
