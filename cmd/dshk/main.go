@@ -213,7 +213,7 @@ func newLoopFactory(store *session.Store, prov llm.Provider, model string, ws st
 		reg.Register(agent.PlanTool{Log: ses.Log})
 		b := session.DefaultBudget()
 		b.SystemText = "You are dsh-lite, a minimal agent. Use tools when needed."
-		return &agent.Loop{
+		return &agent.Loop{SessionID: ses.ID,
 			Model: model, Provider: prov, Registry: reg, Log: ses.Log,
 			Budget: b, Guard: agent.DefaultGuard(), Retry: llm.DefaultPolicy(),
 			AutoResume: true, Stream: true,

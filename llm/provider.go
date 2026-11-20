@@ -44,6 +44,10 @@ type Request struct {
 	Tools       []ToolSpec `json:"tools,omitempty"`
 	MaxTokens   int        `json:"max_tokens,omitempty"`
 	Temperature *float64   `json:"temperature,omitempty"`
+	// User correlates requests to one end-user/session on gateways
+	// (LiteLLM & co. group by it — #13879: without a stable key every
+	// call looked like a fresh conversation).
+	User string `json:"user,omitempty"`
 }
 
 // Usage reports token counts for the call.
@@ -74,6 +78,7 @@ type openaiRequest struct {
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Temperature *float64      `json:"temperature,omitempty"`
 	Stream      bool          `json:"stream,omitempty"`
+	User        string        `json:"user,omitempty"`
 }
 
 // wireMessage is the outgoing message shape: the API requires tool
@@ -148,7 +153,7 @@ type OpenAIProvider struct {
 }
 
 func (p *OpenAIProvider) Complete(ctx context.Context, req *Request) (*Response, error) {
-	or := openaiRequest{Model: req.Model, Messages: wireMessages(req.Messages), MaxTokens: req.MaxTokens, Temperature: req.Temperature}
+	or := openaiRequest{Model: req.Model, Messages: wireMessages(req.Messages), MaxTokens: req.MaxTokens, Temperature: req.Temperature, User: req.User}
 	for _, t := range req.Tools {
 		var ts toolSpec
 		ts.Type = "function"

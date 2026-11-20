@@ -2,7 +2,9 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -76,5 +78,28 @@ func TestStreamErrorClassified(t *testing.T) {
 	var ce *CallError
 	if !AsCallError(err, &ce) || ce.Kind != KindRateLimit {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+// The wire payload carries the session's user key so gateways group
+// the calls (#13879).
+func TestStreamSendsUserField(t *testing.T) {
+	var body []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer ts.Close()
+	p := &OpenAIProvider{BaseURL: ts.URL}
+	if _, err := p.Stream(context.Background(), &Request{Model: "m", User: "ses-1", Messages: []Message{{Role: "user", Content: "hi"}}}, func(Delta) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["user"] != "ses-1" {
+		t.Fatalf("user field missing/mismatched: %v", got["user"])
 	}
 }
