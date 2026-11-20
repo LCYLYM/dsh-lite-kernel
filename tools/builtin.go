@@ -94,8 +94,33 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 // writeAtomic stages the content in a sibling temp file, fsyncs it,
 // renames over the target, and fsyncs every directory between the file
 // and wsRoot so freshly created path components survive a host crash
-// too. Two writers never share a temp name.
+// too. Directory handles are opened before the rename — a dir that
+// can't be opened fails before the file changes, so an acknowledged
+// failure never masks a successful write. Two writers never share a
+// temp name.
 func writeAtomic(path, wsRoot string, data []byte) error {
+	var dirs []*os.File
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		d, err := os.Open(dir)
+		if err != nil {
+			for _, f := range dirs {
+				f.Close()
+			}
+			return fmt.Errorf("tools: open dir %q: %w", dir, err)
+		}
+		dirs = append(dirs, d)
+		if dir == wsRoot {
+			break
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			break
+		}
+	}
+	defer func() {
+		for _, d := range dirs {
+			d.Close()
+		}
+	}()
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
@@ -116,22 +141,9 @@ func writeAtomic(path, wsRoot string, data []byte) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
-	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
-		d, err := os.Open(dir)
-		if err != nil {
-			return fmt.Errorf("tools: sync dir %q: %w", dir, err)
-		}
-		err = d.Sync()
-		d.Close()
-		if err != nil {
-			return fmt.Errorf("tools: sync dir %q: %w", dir, err)
-		}
-		if dir == wsRoot {
-			break
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
+	for _, d := range dirs {
+		if err := d.Sync(); err != nil {
+			return fmt.Errorf("tools: sync dir: %w", err)
 		}
 	}
 	return nil
