@@ -46,3 +46,14 @@ func TestClassify5xxTransient(t *testing.T) {
 		t.Fatalf("got %v", ce.Kind)
 	}
 }
+
+// Provider vocabularies are case-erratic: a camel-case throttle code must
+// still classify as retryable RATE_LIMIT, not degrade to INVALID.
+func TestClassifyMixedCaseRateLimit(t *testing.T) {
+	body := []byte(`{"error":{"code":"RateLimitExceeded","message":"slow down"}}`)
+	resp := &http.Response{StatusCode: 400, Header: http.Header{}}
+	ce := Classify(resp, body, nil)
+	if ce.Kind != KindRateLimit || !ce.Retryable() {
+		t.Fatalf("got kind=%v, want retryable rate limit", ce.Kind)
+	}
+}
