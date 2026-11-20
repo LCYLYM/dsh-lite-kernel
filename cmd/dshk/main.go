@@ -26,7 +26,7 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run|ls|msg|notice|fork|cancel|tail|history|rm> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run|ls|msg|notice|fork|cancel|tail|history|rm|usage> [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -34,7 +34,7 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
-	case "ls", "msg", "fork", "cancel", "tail", "history", "rm", "notice":
+	case "ls", "msg", "notice", "fork", "cancel", "tail", "history", "rm", "usage":
 		cmdAPI(os.Args[1], os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
