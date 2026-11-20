@@ -69,7 +69,12 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{"id": ses.ID, "events": ses.Log.Len()})
+	writeJSON(w, map[string]any{
+		"id":         ses.ID,
+		"workspace":  ses.Workspace,
+		"created_at": ses.CreatedAt,
+		"events":     ses.Log.Len(),
+	})
 }
 
 // postMessage starts a turn in the background and returns immediately;

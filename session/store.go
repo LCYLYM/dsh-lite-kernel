@@ -97,6 +97,12 @@ func (s *Store) Get(id string) (*Session, error) {
 		return nil, err
 	}
 	ses := &Session{ID: id, Log: lg}
+	// CreatedAt isn't persisted; the first event's timestamp is a cheap
+	// stand-in (one line read, no full replay).
+	var first Event
+	if err := lg.ReadFrom(0, func(ev Event) bool { first = ev; return false }); err == nil && !first.At.IsZero() {
+		ses.CreatedAt = first.At.Unix()
+	}
 	s.live[id] = ses
 	return ses, nil
 }
