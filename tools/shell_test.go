@@ -135,3 +135,60 @@ func TestShellOutputCap(t *testing.T) {
 		t.Fatalf("%v", res)
 	}
 }
+
+// Credential-shaped variables must never reach a model-run command —
+// a logged `env` would otherwise exfiltrate the daemon's keys.
+func TestShellScrubsDaemonCredentials(t *testing.T) {
+	t.Setenv("DSHK_TEST_TOKEN_X", "leak-me")
+	t.Setenv("DSHK_TEST_APIKEY", "leak-me-too")
+	res := shellCall(t, "env")
+	out := res["output"].(string)
+	if strings.Contains(out, "DSHK_TEST_TOKEN_X") || strings.Contains(out, "DSHK_TEST_APIKEY") {
+		t.Fatalf("credential leaked into shell env: %v", out)
+	}
+	if !strings.Contains(out, "PATH=") {
+		t.Fatal("env scrub dropped PATH — toolchain needs it")
+	}
+}
+
+// The sandbox's namespace root starts with CAP_SYS_ADMIN, which could
+// umount every tmpfs cover and expose the host — the bounding-set drop
+// before exec must make umount fail.
+func TestShellCannotUnmountCovers(t *testing.T) {
+	if !sandboxed() {
+		t.Skip("user namespaces disabled — no sandbox to confine in")
+	}
+	s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second}
+	args, _ := json.Marshal(map[string]string{"cmd": "umount /usr 2>&1 || echo UMOUNT_FAILED"})
+	out, err := s.Call(context.Background(), args)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	res := out.(map[string]any)
+	if !strings.Contains(res["output"].(string), "UMOUNT_FAILED") {
+		t.Fatalf("umount succeeded inside the sandbox: %v", res)
+	}
+}
+
+// A sandboxed shell must not reach the network — model commands have
+// no business talking to private services or cloud metadata.
+func TestShellNoNetworkByDefault(t *testing.T) {
+	if !sandboxed() {
+		t.Skip("user namespaces disabled — no sandbox to confine in")
+	}
+	s := Shell{W: Workspace{Root: t.TempDir()}, Timeout: 3 * time.Second}
+	// /proc/net/dev inside a fresh net ns lists only lo.
+	args, _ := json.Marshal(map[string]string{"cmd": "cat /proc/net/dev"})
+	out, err := s.Call(context.Background(), args)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	res := out.(map[string]any)
+	got := res["output"].(string)
+	if strings.Contains(got, "eth0") || strings.Contains(got, "ens") || strings.Contains(got, "wlan") {
+		t.Fatalf("host network interfaces visible in sandbox: %q", got)
+	}
+	if !strings.Contains(got, "lo:") {
+		t.Fatalf("expected lo-only net ns, got %q", got)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +29,11 @@ type Shell struct {
 	// hosts where user namespaces are disabled. Off by default — an
 	// unsandboxed shell has the process's full filesystem permissions.
 	AllowUnsandboxed bool
+	// AllowNet keeps the daemon's network inside the sandbox. Off by
+	// default the sandbox also isolates the network — a model command
+	// must not reach private services or cloud metadata endpoints that
+	// Fetch refuses on purpose.
+	AllowNet bool
 }
 
 // sandboxScript runs inside `unshare -rmpf --kill-child`: instead of
@@ -61,7 +67,16 @@ ln -s /proc/self/fd/1 /dev/stdout
 ln -s /proc/self/fd/2 /dev/stderr
 mount -t tmpfs -o size=4m tmpfs /dev/shm
 mount -t tmpfs -o size=64m tmpfs /tmp
-exec sh -c 'cd /mnt && exec sh -c "$1"' _ "$CMD"
+# Drop the capabilities that make the confinement escapable before the
+# model command execs: the namespace root starts with CAP_SYS_ADMIN and
+# could umount every cover above (and CAP_SYS_CHROOT to walk out of any
+# chroot-style anchoring). The bounding set persists across exec, so the
+# command can never regain mount authority. setpriv is part of
+# util-linux like unshare — if it is absent the exec fails loud rather
+# than running unconstrained.
+exec setpriv --no-new-privs \
+  --bounding-set=-sys_admin,-sys_chroot,-sys_module,-sys_rawio,-sys_boot,-mknod,-sys_ptrace,-syslog \
+  sh -c 'cd /mnt && exec sh -c "$1"' _ "$CMD"
 `
 
 var (
@@ -132,8 +147,12 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	}
 	var cmd *exec.Cmd
 	if sandboxed() {
-		cmd = exec.CommandContext(cctx, "unshare", "-rmpf", "--kill-child", "--mount-proc",
-			"sh", "-c", sandboxScript, "dshk-shell", root, a.Cmd)
+		argv := []string{"-rmpf", "--kill-child", "--mount-proc"}
+		if !s.AllowNet {
+			argv = append(argv, "-n") // own network namespace: no connectivity
+		}
+		argv = append(argv, "sh", "-c", sandboxScript, "dshk-shell", root, a.Cmd)
+		cmd = exec.CommandContext(cctx, "unshare", argv...)
 		cmd.Dir = "/"
 	} else if s.AllowUnsandboxed {
 		cmd = exec.CommandContext(cctx, "sh", "-c", a.Cmd)
@@ -145,8 +164,10 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	// output pipes; WaitDelay closes them instead of waiting forever.
 	cmd.WaitDelay = 5 * time.Second
 	// HOME points at a path that does not exist inside the sandbox —
-	// tools that need a writable home (gocache, config) get /tmp.
-	cmd.Env = envWith(os.Environ(), map[string]string{"HOME": "/tmp", "TMPDIR": "/tmp"})
+	// tools that need a writable home (gocache, config) get /tmp. The
+	// daemon's credential-shaped variables never enter a model command —
+	// a logged `env` must not leak DEEPSEEK_API_KEY / DSHK_TOKEN.
+	cmd.Env = envWith(envScrubbed(), map[string]string{"HOME": "/tmp", "TMPDIR": "/tmp"})
 
 	max := s.MaxOutput
 	if max <= 0 {
@@ -175,6 +196,29 @@ func (s Shell) Call(ctx context.Context, args json.RawMessage) (any, error) {
 	}
 	res["exit_code"] = 0
 	return res, nil
+}
+
+// envScrubbed returns the process environment minus credential-shaped
+// variables — names carrying KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL
+// or AUTH — so a shell command cannot exfiltrate daemon credentials
+// through its logged output.
+func envScrubbed() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		u := strings.ToUpper(name)
+		sensitive := false
+		for _, pat := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"} {
+			if strings.Contains(u, pat) {
+				sensitive = true
+				break
+			}
+		}
+		if !sensitive {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 func envWith(base []string, set map[string]string) []string {
