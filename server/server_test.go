@@ -341,3 +341,77 @@ func TestStreamNoDuplicateAfterReplay(t *testing.T) {
 		t.Fatalf("saw %d events, want 14", len(seen))
 	}
 }
+
+// A notice posted to an idle session triggers a wake-driven turn whose
+// first drain injects it — it must not wait for the next user message.
+func TestNoticeWakesIdleSession(t *testing.T) {
+	ts, st := newTestServer(t)
+	defer ts.Close()
+	post(t, ts.URL+"/v1/sessions", `{"workspace":"ws"}`)
+	id := st.List()[0]
+
+	post(t, ts.URL+"/v1/sessions/"+id+"/notices",
+		`{"id":"n-wake","from":"child-1","kind":"done","payload":{"ok":true}}`)
+
+	var inject bool
+	for i := 0; i < 50; i++ {
+		ses, _ := st.Get(id)
+		inject = false
+		ses.Log.ReadFrom(0, func(ev session.Event) bool {
+			if ev.Type == "mailbox/inject" {
+				inject = true
+			}
+			return !inject
+		})
+		if inject {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !inject {
+		t.Fatal("notice never consumed by a wake-driven turn")
+	}
+}
+
+// wake=false enqueues without waking: an idle session must not start a
+// turn on a notice that reports an aborted outcome (#13859).
+func TestNoticeWakeFalseDoesNotWake(t *testing.T) {
+	ts, st := newTestServer(t)
+	defer ts.Close()
+	post(t, ts.URL+"/v1/sessions", `{"workspace":"ws"}`)
+	id := st.List()[0]
+
+	post(t, ts.URL+"/v1/sessions/"+id+"/notices",
+		`{"id":"n-nowake","from":"child-1","kind":"aborted","wake":false,"payload":{}}`)
+
+	ses, _ := st.Get(id)
+	time.Sleep(300 * time.Millisecond)
+	inject := false
+	ses.Log.ReadFrom(0, func(ev session.Event) bool {
+		if ev.Type == "mailbox/inject" {
+			inject = true
+		}
+		return !inject
+	})
+	if inject {
+		t.Fatal("wake=false notice woke the idle session")
+	}
+	// The notice still delivers — on the next real turn, not a wake.
+	post(t, ts.URL+"/v1/sessions/"+id+"/messages", `{"text":"hi"}`)
+	for i := 0; i < 50; i++ {
+		inject = false
+		ses.Log.ReadFrom(0, func(ev session.Event) bool {
+			if ev.Type == "mailbox/inject" {
+				inject = true
+			}
+			return !inject
+		})
+		if inject {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !inject {
+		t.Fatal("wake=false notice never delivered on the next turn")
+	}
+}

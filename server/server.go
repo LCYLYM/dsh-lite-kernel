@@ -243,7 +243,7 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 		}()
 		defer cancel()
-		defer s.dropLoop(ses.ID)
+		defer s.dropLoop(ses.ID, loop)
 		if _, err := loop.Run(ctx, body.Text); err != nil {
 			log.Printf("session %s: turn ended: %v", ses.ID, err)
 		}
@@ -304,6 +304,31 @@ func (s *Server) postNotice(w http.ResponseWriter, r *http.Request) {
 	if err := agent.Post(ses.Log, n); err != nil {
 		writeErr(w, err)
 		return
+	}
+	// Wake an idle session so the notice is consumed now, not whenever
+	// the next user message happens to arrive — unless the poster opted
+	// out: a notice reporting an aborted/cancelled outcome must be
+	// enqueued for the next turn, not used to re-trigger the model
+	// (#13859: a stop notice that wakes the idle parent re-dispatches
+	// the very work the user just stopped).
+	if n.Wake == nil || *n.Wake {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			l := s.loopFor(ses)
+			state, err := l.Resume(ctx)
+			if state == agent.Failed && !errors.Is(err, agent.ErrTurnBusy) {
+				log.Printf("notice resume %s: %v", ses.ID, err)
+			}
+			// Only a wake that acquired the turn may release the cached
+			// loop: on ErrTurnBusy this is the loop serving the active
+			// turn, and evicting it would let the next request build a
+			// second Loop with its own turnMu — two turns interleaving
+			// one history.
+			if !errors.Is(err, agent.ErrTurnBusy) {
+				s.dropLoop(ses.ID, l)
+			}
+		}()
 	}
 	writeJSON(w, map[string]any{"posted": n.ID})
 }
@@ -490,9 +515,13 @@ func writeErr(w http.ResponseWriter, err error) {
 // dropLoop forgets a session's loop once its turn ends — the loop is
 // cheap to rebuild from the log, so holding every past loop in the map
 // would grow server memory with session count, not with live turns.
-func (s *Server) dropLoop(id string) {
+// dropLoop compare-deletes: an unconditional map delete would evict a
+// replacement loop already serving a newer turn.
+func (s *Server) dropLoop(id string, l *agent.Loop) {
 	s.mu.Lock()
-	delete(s.loops, id)
+	if s.loops[id] == l {
+		delete(s.loops, id)
+	}
 	s.mu.Unlock()
 }
 
