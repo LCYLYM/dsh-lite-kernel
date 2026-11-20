@@ -78,14 +78,44 @@ func (t WriteFile) Call(_ context.Context, args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	tmp := p + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(tmp, []byte(a.Content), 0o600); err != nil {
+	if err := writeAtomic(p, []byte(a.Content)); err != nil {
 		return nil, err
 	}
-	return map[string]any{"path": p}, os.Rename(tmp, p)
+	return map[string]any{"path": p}, nil
+}
+
+// writeAtomic stages the content in a sibling temp file, fsyncs it,
+// renames over the target, and fsyncs the directory — an acknowledged
+// write survives a host crash, and two writers never share a temp name.
+func writeAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 // Echo returns its input — the smoke-test tool.
