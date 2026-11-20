@@ -101,6 +101,18 @@ func (s *Store) Get(id string) (*Session, error) {
 	return ses, nil
 }
 
+// Close flushes and closes every live session log; call it on
+// shutdown so no buffered write is lost. The store stays usable for
+// List but Get recreates sessions lazily afterward.
+func (s *Store) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, ses := range s.live {
+		ses.Log.Close()
+		delete(s.live, id)
+	}
+}
+
 // List returns live session ids (a lock-held snapshot, never a stale copy).
 func (s *Store) List() []string {
 	s.mu.Lock()
