@@ -91,13 +91,17 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 			if e != nil {
 				return e
 			}
-			// EMPTY_RESPONSE (upstream #13822): a "stop" answer carrying no
-			// text and no tool call is not a completed step — deepseek's
-			// reasoning-only drafts hit this. Retry through the same
-			// policy as transient faults; if it stays empty the turn goes
-			// Waiting instead of silently "completing".
-			if len(resp.Message.ToolCalls) == 0 &&
-				strings.TrimSpace(contentText(resp.Message.Content)) == "" {
+			// EMPTY_RESPONSE (upstream #13822): a "stop" answer carrying
+			// no text and no tool call is not a completed step —
+			// deepseek's reasoning-only drafts hit this. Retry through
+			// the same policy as transient faults; if it stays empty the
+			// turn goes Waiting instead of silently "completing". A blank
+			// *truncated* reply is not an empty response: it takes the
+			// continuation path below.
+			fin := resp.FinishReason
+			trunc := fin == "length" || fin == "max_tokens"
+			if !trunc && len(resp.Message.ToolCalls) == 0 &&
+				!hasVisibleText(resp.Message.Content) {
 				return &llm.CallError{Kind: llm.KindTransient,
 					Message: "llm: provider returned an empty message"}
 			}
@@ -162,6 +166,29 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 	}
 	l.Log.Append("turn/end", map[string]any{"reason": "aborted", "detail": "MaxSteps exceeded"})
 	return Aborted, errors.New("agent: step budget exhausted")
+}
+
+// hasVisibleText reports whether content carries a user-visible text
+// block. Reasoning-only drafts are arrays/objects without any "text",
+// which upstream counts as an empty response (#13822).
+func hasVisibleText(c any) bool {
+	switch v := c.(type) {
+	case string:
+		return strings.TrimSpace(v) != ""
+	case []any:
+		for _, b := range v {
+			if s, ok := b.(string); ok && strings.TrimSpace(s) != "" {
+				return true
+			}
+			if m, ok := b.(map[string]any); ok {
+				if s, ok2 := m["text"].(string); ok2 && strings.TrimSpace(s) != "" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return false
 }
 
 func contentText(c any) string {

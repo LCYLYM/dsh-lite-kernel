@@ -197,3 +197,35 @@ func TestPersistentEmptyResponseGoesWaiting(t *testing.T) {
 		t.Fatalf("state=%s err=%v", state, err)
 	}
 }
+
+// Reasoning-only content blocks (upstream #13822's actual shape) count
+// as an empty response too — JSON-serializing the blocks must not pass
+// the blank check.
+type reasoningProvider struct{ called int }
+
+func (r *reasoningProvider) Complete(_ context.Context, req *llm.Request) (*llm.Response, error) {
+	r.called++
+	if last := req.Messages[len(req.Messages)-1]; last.Role == "tool" {
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}, nil
+	}
+	if r.called == 1 {
+		return &llm.Response{
+			Message:      llm.Message{Role: "assistant", Content: []any{map[string]any{"type": "reasoning", "reasoning": "draft"}}},
+			FinishReason: "stop",
+		}, nil
+	}
+	args, _ := json.Marshal(map[string]string{"text": "x"})
+	return &llm.Response{
+		Message:      llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "echo", Args: args}}},
+		FinishReason: "tool_calls",
+	}, nil
+}
+
+func TestReasoningOnlyResponseIsRetried(t *testing.T) {
+	loop, _ := newLoop(t, &reasoningProvider{})
+	loop.Retry = llm.Policy{Retries: 2, Base: time.Millisecond}
+	state, err := loop.Run(context.Background(), "hi")
+	if state != Completed || err != nil {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+}
