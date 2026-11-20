@@ -122,6 +122,24 @@ func TestStreamResumeFromSeq(t *testing.T) {
 	}
 }
 
+// A non-numeric after_seq must not silently replay the whole log.
+func TestRejectsBadAfterSeq(t *testing.T) {
+	ts, st := newTestServer(t)
+	defer ts.Close()
+	ses, err := st.Create("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(ts.URL + "/v1/sessions/" + ses.ID + "/events?after_seq=abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
 func TestRejectsMalformedAndOversizedBodies(t *testing.T) {
 	ts, _ := newTestServer(t)
 	defer ts.Close()
