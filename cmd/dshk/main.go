@@ -263,13 +263,21 @@ func cmdServe(args []string) {
 	sig, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler()}
+	drained := make(chan struct{})
 	go func() {
 		<-sig.Done()
 		to, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(to)
+		close(drained)
 	}()
 	err = httpSrv.ListenAndServe()
+	// ListenAndServe returns as soon as Shutdown closes the listener —
+	// before draining finishes. Wait for the (timeout-bounded) drain so
+	// in-flight requests keep their responses and their open logs.
+	if sig.Err() != nil {
+		<-drained
+	}
 	if cerr := store.Close(); cerr != nil {
 		log.Printf("store close: %v", cerr)
 	}
