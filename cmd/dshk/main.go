@@ -26,7 +26,7 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run|ls|msg|notice|fork|cancel|tail|history|rm> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: dshk <serve|run|ls|msg|notice|fork|cancel|tail|history|rm|usage> [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -34,7 +34,7 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
-	case "ls", "msg", "fork", "cancel", "tail", "history", "rm", "notice":
+	case "ls", "msg", "notice", "fork", "cancel", "tail", "history", "rm", "usage":
 		cmdAPI(os.Args[1], os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
@@ -140,6 +140,8 @@ func cmdAPI(name string, args []string) {
 		call("GET", id(0)+"/history"+q, "")
 	case "rm":
 		call("DELETE", id(0), "")
+	case "usage":
+		call("GET", id(0)+"/usage", "")
 	case "notice":
 		// dshk notice <id> [-nowake] text… — enqueues a durable notice;
 		// -nowake leaves it for the next turn instead of waking an idle

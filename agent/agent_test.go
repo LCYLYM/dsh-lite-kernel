@@ -396,7 +396,10 @@ func TestSessionTokenBudgetAborts(t *testing.T) {
 	if state != Aborted || err == nil {
 		t.Fatalf("state=%s err=%v", state, err)
 	}
-	u := session.Usage(lg)
+	u, uerr := session.Usage(lg)
+	if uerr != nil {
+		t.Fatal(uerr)
+	}
 	if u.InputTokens != 100 || u.OutputTokens != 50 || u.Steps != 1 {
 		t.Fatalf("usage=%v", u)
 	}

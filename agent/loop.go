@@ -143,7 +143,11 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 		// session aborts without contacting the provider (also covers
 		// reopened logs, where only durable usage survives).
 		if l.Guard.MaxSessionTokens > 0 {
-			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+			u, uerr := session.Usage(l.Log)
+			if uerr != nil {
+				return Failed, fmt.Errorf("agent: usage accounting: %w", uerr)
+			}
+			if u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
 				l.Log.Append("turn/end", map[string]any{
 					"reason": "aborted",
 					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
@@ -247,7 +251,11 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 		// Crossing the cap aborts before tool side effects — this
 		// step's tool calls do not run. Same ordering as the guards.
 		if l.Guard.MaxSessionTokens > 0 {
-			if u := session.Usage(l.Log); u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
+			u, uerr := session.Usage(l.Log)
+			if uerr != nil {
+				return Failed, fmt.Errorf("agent: usage accounting: %w", uerr)
+			}
+			if u.InputTokens+u.OutputTokens > l.Guard.MaxSessionTokens {
 				l.Log.Append("turn/end", map[string]any{
 					"reason": "aborted",
 					"detail": fmt.Sprintf("session token budget %d exceeded (%d used)", l.Guard.MaxSessionTokens, u.InputTokens+u.OutputTokens),
