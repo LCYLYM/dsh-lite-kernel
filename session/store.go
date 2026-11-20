@@ -63,6 +63,8 @@ func (s *Store) Fork(id string) (*Session, error) {
 	}
 	defer in.Close()
 
+	// create() never reuses an on-disk id, so the destination is always a
+	// fresh file distinct from the source.
 	ses, err := s.create(ws)
 	if err != nil {
 		return nil, err
@@ -71,28 +73,51 @@ func (s *Store) Fork(id string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	fail := func(err error) (*Session, error) {
 		out.Close()
+		ses.Log.Close()
+		delete(s.live, ses.ID)
+		os.Remove(ses.Log.path)
 		return nil, err
 	}
-	out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return fail(err)
+	}
+	// The copy is the fork's whole history — fsync before acknowledging
+	// like Append does, or a crash can lose an "accepted" fork.
+	if err := out.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := out.Close(); err != nil {
+		return fail(err)
+	}
 	if err := ses.Log.reindex(); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	return ses, nil
 }
 
 func (s *Store) create(workspace string) (*Session, error) {
-	s.seq++
-	id := fmt.Sprintf("session-%d-%d", s.seq, len(s.live)+1)
-	path := filepath.Join(s.dir, id+".jsonl")
-	lg, err := OpenLog(path)
-	if err != nil {
-		return nil, err
+	// Allocate an id that exists nowhere on disk — after a restart seq
+	// is reseeded and a reused name would reopen (or truncate) another
+	// session's log.
+	for {
+		s.seq++
+		id := fmt.Sprintf("session-%d-%d", s.seq, len(s.live)+1)
+		path := filepath.Join(s.dir, id+".jsonl")
+		if _, err := os.Stat(path); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		lg, err := OpenLog(path)
+		if err != nil {
+			return nil, err
+		}
+		ses := &Session{ID: id, Workspace: workspace, Log: lg}
+		s.live[id] = ses
+		return ses, nil
 	}
-	ses := &Session{ID: id, Workspace: workspace, Log: lg}
-	s.live[id] = ses
-	return ses, nil
 }
 
 // CreateOrReuseBlank returns an existing blank session for workspace if
