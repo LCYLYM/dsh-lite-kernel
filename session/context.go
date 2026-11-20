@@ -92,8 +92,32 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 		count++
 		rev = append(rev, m)
 	}
+	// A turn that crashed between the assistant tool_call and its
+	// tool/result leaves a dangling call in the log; strict providers
+	// require a result per call and would reject every later request,
+	// bricking the session (upstream #13790). Synthesize an
+	// interrupted-marker result directly after the call.
+	results := map[string]bool{}
+	for _, m := range rev {
+		if m.Role == "tool" {
+			results[m.ToolCallID] = true
+		}
+	}
 	for i := len(rev) - 1; i >= 0; i-- {
-		msgs = append(msgs, rev[i])
+		m := rev[i]
+		msgs = append(msgs, m)
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if !results[tc.ID] {
+				msgs = append(msgs, llm.Message{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    "[tool call was interrupted before it produced a result]",
+				})
+			}
+		}
 	}
 	if b.SystemText != "" {
 		msgs = append([]llm.Message{{Role: "system", Content: b.SystemText}}, msgs...)
