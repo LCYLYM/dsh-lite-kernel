@@ -137,3 +137,22 @@ func BenchmarkReplayLongLog(b *testing.B) {
 		}
 	}
 }
+
+// The token-budget check runs Usage once per step on every turn; the
+// incremental index must keep repeat calls O(new events), not O(history).
+func BenchmarkUsageRepeatCalls(b *testing.B) {
+	dir := b.TempDir()
+	lg, _ := session.OpenLog(filepath.Join(dir, "s.jsonl"))
+	for i := 0; i < 50000; i++ {
+		lg.Append("assistant/message", map[string]any{"role": "assistant", "content": "x", "prompt_tokens": 10})
+	}
+	if _, err := session.Usage(lg); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := session.Usage(lg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
