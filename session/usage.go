@@ -43,7 +43,10 @@ func Usage(lg *Log) (UsageTotal, error) {
 	st := usageFor(lg)
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	last := st.scanned
+	// Accumulate off-index: committing the delta and the cursor must be
+	// atomic. A read that fails mid-scan leaves both untouched, so the
+	// retry cannot double-count the events it did deliver.
+	u, last := st.u, st.scanned
 	err := lg.ReadFrom(st.scanned, func(ev Event) bool {
 		last = ev.Seq
 		if ev.Type != "assistant/message" {
@@ -54,15 +57,15 @@ func Usage(lg *Log) (UsageTotal, error) {
 			Completion int `json:"completion_tokens"`
 		}
 		if json.Unmarshal(ev.Data, &t) == nil && (t.Prompt > 0 || t.Completion > 0) {
-			st.u.InputTokens += t.Prompt
-			st.u.OutputTokens += t.Completion
-			st.u.Steps++
+			u.InputTokens += t.Prompt
+			u.OutputTokens += t.Completion
+			u.Steps++
 		}
 		return true
 	})
 	if err != nil {
 		return UsageTotal{}, err
 	}
-	st.scanned = last
+	st.scanned, st.u = last, u
 	return st.u, nil
 }
