@@ -310,7 +310,13 @@ func offlineSafeProxyList(v string) bool {
 		if e == "off" || e == "direct" {
 			continue
 		}
-		if !strings.HasPrefix(e, "file://") || strings.Contains(strings.TrimPrefix(e, "file://"), "@") {
+		if !strings.HasPrefix(e, "file://") {
+			return false
+		}
+		// Only the authority segment can carry userinfo; an '@' in
+		// the path (a directory literally named "x@y") is legal.
+		authority, _, _ := strings.Cut(strings.TrimPrefix(e, "file://"), "/")
+		if strings.Contains(authority, "@") {
 			return false
 		}
 	}
