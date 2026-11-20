@@ -45,7 +45,7 @@ type streamChunk struct {
 
 // Stream implements Streamer for OpenAI-compatible endpoints.
 func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, delta func(Delta) error) (*Response, error) {
-	or := openaiRequest{Model: req.Model, Messages: wireMessages(req.Messages), MaxTokens: req.MaxTokens, Temperature: req.Temperature}
+	or := openaiRequest{Model: req.Model, Messages: wireMessages(req.Messages), MaxTokens: req.MaxTokens, Temperature: req.Temperature, User: req.User}
 	for _, t := range req.Tools {
 		var ts toolSpec
 		ts.Type = "function"

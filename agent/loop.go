@@ -37,7 +37,10 @@ type Loop struct {
 	Retry      llm.Policy
 	AutoResume bool // re-drive the turn after Waiting (goal runs, #13621)
 	ResumeMax  int
-	Stream     bool // prefer Streamer providers; deltas land in the log
+	// SessionID rides each request as the OpenAI "user" field so API
+	// gateways can correlate this session's calls (#13879).
+	SessionID string
+	Stream    bool // prefer Streamer providers; deltas land in the log
 
 	turnMu sync.Mutex // one in-flight turn per log — see Run
 }
@@ -176,6 +179,7 @@ func (l *Loop) drive(ctx context.Context) (state TurnState, err error) {
 			Model:    l.Model,
 			Messages: msgs,
 			Tools:    l.Registry.Specs(),
+			User:     l.SessionID,
 		}
 		err = l.Retry.Do(ctx, func(c context.Context) error {
 			// A stalled provider call must not park the turn until the
