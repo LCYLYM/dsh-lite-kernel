@@ -17,10 +17,10 @@ import (
 type TurnState string
 
 const (
-	Completed   TurnState = "completed"
-	Aborted     TurnState = "aborted" // guard stopped a degenerate loop
-	Waiting     TurnState = "waiting" // retry budget spent; resumable
-	Failed      TurnState = "failed"
+	Completed TurnState = "completed"
+	Aborted   TurnState = "aborted" // guard stopped a degenerate loop
+	Waiting   TurnState = "waiting" // retry budget spent; resumable
+	Failed    TurnState = "failed"
 )
 
 // Loop runs turns for one session.
@@ -105,7 +105,7 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		l.Log.Append("assistant/message", map[string]any{
 			"role": "assistant", "content": resp.Message.Content,
 			"tool_calls": rawCalls(resp.Message.ToolCalls),
-			"finish": resp.FinishReason, "truncated": truncated,
+			"finish":     resp.FinishReason, "truncated": truncated,
 		})
 
 		// Guard: repetition / no-progress / caps.
@@ -124,6 +124,12 @@ func (l *Loop) drive(ctx context.Context) (TurnState, error) {
 		}
 
 		for _, tc := range resp.Message.ToolCalls {
+			// A cancelled turn must not run the remaining tools — a file
+			// write after /cancel would still land (review finding).
+			if err := ctx.Err(); err != nil {
+				l.Log.Append("turn/end", map[string]any{"reason": "cancelled", "error": err.Error()})
+				return Aborted, err
+			}
 			l.Log.Append("tool/call", map[string]any{"id": tc.ID, "name": tc.Name})
 			out, terr := l.Registry.Call(ctx, tc)
 			if terr != nil {

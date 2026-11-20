@@ -31,9 +31,13 @@ type Server struct {
 	Model    string
 	NewLoop  func(ses *session.Session) *agent.Loop
 
-	mu    sync.Mutex
-	loops map[string]*agent.Loop
-	turns map[string]context.CancelFunc
+	mu      sync.Mutex
+	loops   map[string]*agent.Loop
+	turnSeq int64
+	// turns maps session id → per-turn token → cancel. Each accepted
+	// message gets its own entry so overlapping turns all cancel, and a
+	// finished turn removes only its own handle.
+	turns map[string]map[int64]context.CancelFunc
 }
 
 func (s *Server) Handler() http.Handler {
@@ -90,17 +94,27 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loop := s.loopFor(ses)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Register before the goroutine starts: a cancel issued between
+	// acceptance and goroutine scheduling must still find the handle.
+	s.mu.Lock()
+	if s.turns == nil {
+		s.turns = map[string]map[int64]context.CancelFunc{}
+	}
+	if s.turns[ses.ID] == nil {
+		s.turns[ses.ID] = map[int64]context.CancelFunc{}
+	}
+	s.turnSeq++
+	tok := s.turnSeq
+	s.turns[ses.ID][tok] = cancel
+	s.mu.Unlock()
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		s.mu.Lock()
-		if s.turns == nil {
-			s.turns = map[string]context.CancelFunc{}
-		}
-		s.turns[ses.ID] = cancel
-		s.mu.Unlock()
 		defer func() {
 			s.mu.Lock()
-			delete(s.turns, ses.ID)
+			delete(s.turns[ses.ID], tok)
+			if len(s.turns[ses.ID]) == 0 {
+				delete(s.turns, ses.ID)
+			}
 			s.mu.Unlock()
 			cancel()
 		}()
@@ -121,14 +135,20 @@ func (s *Server) cancelTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	cancel, ok := s.turns[ses.ID]
+	handles := s.turns[ses.ID]
+	cancels := make([]context.CancelFunc, 0, len(handles))
+	for _, c := range handles {
+		cancels = append(cancels, c)
+	}
 	s.mu.Unlock()
-	if !ok {
+	if len(cancels) == 0 {
 		http.Error(w, "no active turn", http.StatusConflict)
 		return
 	}
-	cancel()
-	writeJSON(w, map[string]any{"cancelled": true})
+	for _, c := range cancels {
+		c()
+	}
+	writeJSON(w, map[string]any{"cancelled": len(cancels)})
 }
 
 // postNotice delivers a cross-agent mailbox notice.
