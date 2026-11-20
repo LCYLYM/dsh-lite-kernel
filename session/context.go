@@ -106,17 +106,37 @@ func BuildContext(lg *Log, b ContextBudget) ([]llm.Message, error) {
 	for i := len(rev) - 1; i >= 0; i-- {
 		m := rev[i]
 		msgs = append(msgs, m)
+		count++
 		if m.Role != "assistant" {
 			continue
 		}
 		for _, tc := range m.ToolCalls {
-			if !results[tc.ID] {
-				msgs = append(msgs, llm.Message{
-					Role:       "tool",
-					ToolCallID: tc.ID,
-					Content:    "[tool call was interrupted before it produced a result]",
-				})
+			if results[tc.ID] {
+				continue
 			}
+			synth := llm.Message{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    "[tool call was interrupted before it produced a result]",
+			}
+			// Synthesized results spend the same budget; a call that
+			// would not fit is dropped from the message instead, which
+			// keeps the request valid without exceeding the limits.
+			est := len(tc.ID) + 128
+			if used+est > b.MaxBytes || count+1 > b.MaxEvents {
+				var keep []llm.ToolCall
+				for _, tc2 := range m.ToolCalls {
+					if tc2.ID != tc.ID {
+						keep = append(keep, tc2)
+					}
+				}
+				m.ToolCalls = keep
+				msgs[len(msgs)-1] = m
+				continue
+			}
+			msgs = append(msgs, synth)
+			used += est
+			count++
 		}
 	}
 	if b.SystemText != "" {
