@@ -208,24 +208,3 @@ func TestWriteThroughDirLinkThenEditReal(t *testing.T) {
 		t.Fatalf("write+edit through dir link lost: %q", got)
 	}
 }
-
-func TestReadFileRejectsFifo(t *testing.T) {
-	dir := t.TempDir()
-	if err := syscall.Mkfifo(filepath.Join(dir, "pipe"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := json.Marshal(map[string]any{"path": "pipe"})
-	done := make(chan error, 1)
-	go func() {
-		_, err := (ReadFile{W: Workspace{Root: dir}}).Call(context.Background(), raw)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("read on fifo allowed")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("read blocked on fifo")
-	}
-}

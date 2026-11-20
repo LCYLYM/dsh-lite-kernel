@@ -124,6 +124,9 @@ func writeAtomic(p string, data []byte, mode os.FileMode, preserve os.FileInfo) 
 	if _, err := tmp.Write(data); err != nil {
 		return cleanup(err)
 	}
+	if err := tmp.Sync(); err != nil {
+		return cleanup(err)
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmp.Name())
 		return err
@@ -131,6 +134,10 @@ func writeAtomic(p string, data []byte, mode os.FileMode, preserve os.FileInfo) 
 	if err := os.Rename(tmp.Name(), p); err != nil {
 		os.Remove(tmp.Name())
 		return err
+	}
+	if d, err := os.Open(filepath.Dir(p)); err == nil {
+		_ = d.Sync()
+		d.Close()
 	}
 	return nil
 }
