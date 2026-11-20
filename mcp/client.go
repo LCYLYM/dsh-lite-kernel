@@ -20,12 +20,14 @@ const DefaultCallTimeout = 60 * time.Second
 
 // Client is one stdio MCP server connection.
 type Client struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	mu     sync.Mutex
-	nextID int
-	lines  chan json.RawMessage
-	done   chan error
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+
+	mu      sync.Mutex
+	nextID  int
+	pending map[int]chan rpcMsg
+	wrMu    sync.Mutex
+	done    chan error
 }
 
 // Connect spawns command and completes the MCP initialize handshake
@@ -38,7 +40,10 @@ func Connect(ctx context.Context, initTimeout time.Duration, command string, arg
 	cctx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, command, args...)
+	// The child must outlive the init deadline: CommandContext would
+	// kill it the moment cctx ends, so spawn unbound and kill on
+	// handshake failure or Close instead.
+	cmd := exec.Command(command, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("mcp: %s: %w", command, err)
@@ -50,7 +55,7 @@ func Connect(ctx context.Context, initTimeout time.Duration, command string, arg
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("mcp: spawn %s: %w", command, err)
 	}
-	c := &Client{cmd: cmd, stdin: stdin, lines: make(chan json.RawMessage, 64), done: make(chan error, 1)}
+	c := &Client{cmd: cmd, stdin: stdin, pending: map[int]chan rpcMsg{}, done: make(chan error, 1)}
 	go c.readLoop(stdout)
 
 	_, err = c.call(cctx, "initialize", map[string]any{
@@ -100,34 +105,52 @@ type rpcMsg struct {
 	} `json:"error,omitempty"`
 }
 
+// call registers a response slot before writing so the read loop can
+// route the reply to this caller; a slow sibling call can no longer
+// consume another call's response out of a shared queue.
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	c.mu.Lock()
 	c.nextID++
 	id := c.nextID
+	ch := make(chan rpcMsg, 1)
+	c.pending[id] = ch
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+	}()
+
 	body, err := json.Marshal(rpcMsg{JSONRPC: "2.0", ID: id, Method: method, Params: mustJSON(params)})
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.stdin.Write(append(body, '\n')); err != nil {
+	c.wrMu.Lock()
+	_, err = c.stdin.Write(append(body, '\n'))
+	c.wrMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	for {
+	select {
+	case <-ctx.Done():
+		// A response that raced in before the slot was dropped still
+		// wins — including its error.
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case err := <-c.done:
-			return nil, err
-		case raw := <-c.lines:
-			var m rpcMsg
-			if json.Unmarshal(raw, &m) != nil || m.ID != id {
-				continue
-			}
+		case m := <-ch:
 			if m.Error != nil {
 				return nil, fmt.Errorf("mcp: %s: %s", method, m.Error.Message)
 			}
 			return m.Result, nil
+		default:
 		}
+		return nil, ctx.Err()
+	case err := <-c.done:
+		return nil, err
+	case m := <-ch:
+		if m.Error != nil {
+			return nil, fmt.Errorf("mcp: %s: %s", method, m.Error.Message)
+		}
+		return m.Result, nil
 	}
 }
 
@@ -136,6 +159,8 @@ func (c *Client) notify(method string, params any) error {
 	if err != nil {
 		return err
 	}
+	c.wrMu.Lock()
+	defer c.wrMu.Unlock()
 	_, err = c.stdin.Write(append(body, '\n'))
 	return err
 }
@@ -144,10 +169,19 @@ func (c *Client) readLoop(r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), 32<<20)
 	for sc.Scan() {
-		line := sc.Bytes()
-		cp := make([]byte, len(line))
-		copy(cp, line)
-		c.lines <- cp
+		var m rpcMsg
+		if json.Unmarshal(sc.Bytes(), &m) != nil {
+			continue
+		}
+		if m.ID == 0 {
+			continue // server notification: no caller is waiting
+		}
+		c.mu.Lock()
+		if ch, ok := c.pending[m.ID]; ok {
+			delete(c.pending, m.ID)
+			ch <- m
+		}
+		c.mu.Unlock()
 	}
 	err := sc.Err()
 	if err == nil {
