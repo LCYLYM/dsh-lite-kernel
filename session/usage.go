@@ -1,6 +1,9 @@
 package session
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sync"
+)
 
 // UsageTotal is the summed token spend of a session, aggregated from
 // usage fields on assistant/message events — accounting rides the same
@@ -11,12 +14,41 @@ type UsageTotal struct {
 	Steps        int `json:"steps"` // model calls with reported usage
 }
 
-// Usage sums turn/usage events — O(log), only over the offset index.
-// The read error propagates: a partial total must never pass for a
-// complete accounting (billing, budget checks).
+// usageState is the per-log aggregate: rebuilt once on first call,
+// then advanced only over events appended since the last scan — the
+// same shape as the mailbox index. drive() budgets every step against
+// Usage, so a full reread would cost O(steps × history) — on a long
+// session that is hundreds of megabytes of IO per turn.
+type usageState struct {
+	mu      sync.Mutex
+	scanned int64
+	u       UsageTotal
+}
+
+var usages sync.Map // *Log -> *usageState
+
+func usageFor(lg *Log) *usageState {
+	st, loaded := usages.LoadOrStore(lg, &usageState{})
+	if !loaded {
+		// The index must not root a closed log forever.
+		lg.OnClose(func() { usages.Delete(lg) })
+	}
+	return st.(*usageState)
+}
+
+// Usage sums the usage fields on assistant/message events. The read
+// error propagates without advancing the index: a partial total must
+// never pass for a complete accounting (billing, budget checks).
 func Usage(lg *Log) (UsageTotal, error) {
-	var u UsageTotal
-	err := lg.ReadFrom(0, func(ev Event) bool {
+	st := usageFor(lg)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// Accumulate off-index: committing the delta and the cursor must be
+	// atomic. A read that fails mid-scan leaves both untouched, so the
+	// retry cannot double-count the events it did deliver.
+	u, last := st.u, st.scanned
+	err := lg.ReadFrom(st.scanned, func(ev Event) bool {
+		last = ev.Seq
 		if ev.Type != "assistant/message" {
 			return true
 		}
@@ -31,5 +63,9 @@ func Usage(lg *Log) (UsageTotal, error) {
 		}
 		return true
 	})
-	return u, err
+	if err != nil {
+		return UsageTotal{}, err
+	}
+	st.scanned, st.u = last, u
+	return st.u, nil
 }
