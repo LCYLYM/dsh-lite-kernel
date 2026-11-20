@@ -141,13 +141,20 @@ func TestShellOutputCap(t *testing.T) {
 func TestShellScrubsDaemonCredentials(t *testing.T) {
 	t.Setenv("DSHK_TEST_TOKEN_X", "leak-me")
 	t.Setenv("DSHK_TEST_APIKEY", "leak-me-too")
+	t.Setenv("DSHK_TEST_HTTPS_PROXY", "http://user:pass@proxy:8080")
+	t.Setenv("GIT_AUTHOR_NAME", "kernel-bot")
 	res := shellCall(t, "env")
 	out := res["output"].(string)
-	if strings.Contains(out, "DSHK_TEST_TOKEN_X") || strings.Contains(out, "DSHK_TEST_APIKEY") {
-		t.Fatalf("credential leaked into shell env: %v", out)
+	for _, name := range []string{"DSHK_TEST_TOKEN_X", "DSHK_TEST_APIKEY", "DSHK_TEST_HTTPS_PROXY"} {
+		if strings.Contains(out, name) {
+			t.Fatalf("credential %s leaked into shell env: %v", name, out)
+		}
 	}
 	if !strings.Contains(out, "PATH=") {
 		t.Fatal("env scrub dropped PATH — toolchain needs it")
+	}
+	if !strings.Contains(out, "GIT_AUTHOR_NAME=kernel-bot") {
+		t.Fatal("env scrub stripped git's own config namespace")
 	}
 }
 
