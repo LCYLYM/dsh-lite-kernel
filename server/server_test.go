@@ -59,7 +59,7 @@ func post(t *testing.T, url, body string) {
 func TestStreamResumeFromSeq(t *testing.T) {
 	ts, st := newTestServer(t)
 	defer ts.Close()
-	post(t, ts.URL+"/v1/sessions", `{"workspace":"ws"}`)
+	post(t, ts.URL+"/v1/sessions", `{"workspace":"`+t.TempDir()+`"}`)
 	id := st.List()[0]
 	post(t, ts.URL+"/v1/sessions/"+id+"/messages", `{"text":"hi"}`)
 	time.Sleep(300 * time.Millisecond)
@@ -436,7 +436,7 @@ func TestStreamNoDuplicateAfterReplay(t *testing.T) {
 func TestNoticeWakesIdleSession(t *testing.T) {
 	ts, st := newTestServer(t)
 	defer ts.Close()
-	post(t, ts.URL+"/v1/sessions", `{"workspace":"ws"}`)
+	post(t, ts.URL+"/v1/sessions", `{"workspace":"`+t.TempDir()+`"}`)
 	id := st.List()[0]
 
 	post(t, ts.URL+"/v1/sessions/"+id+"/notices",
@@ -467,7 +467,7 @@ func TestNoticeWakesIdleSession(t *testing.T) {
 func TestNoticeWakeFalseDoesNotWake(t *testing.T) {
 	ts, st := newTestServer(t)
 	defer ts.Close()
-	post(t, ts.URL+"/v1/sessions", `{"workspace":"ws"}`)
+	post(t, ts.URL+"/v1/sessions", `{"workspace":"`+t.TempDir()+`"}`)
 	id := st.List()[0]
 
 	post(t, ts.URL+"/v1/sessions/"+id+"/notices",
@@ -534,5 +534,22 @@ func TestUsageEndpoint(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != 404 {
 		t.Fatalf("missing session: status %d", resp2.StatusCode)
+	}
+}
+
+// A workspace that cannot serve as a tool root is a loud 400 at
+// creation — the loop honors the recorded path, so a bad one would
+// surface as mysteriously failing tools instead.
+func TestCreateSessionRejectsMissingWorkspace(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/sessions", "application/json",
+		strings.NewReader(`{"workspace":"/nonexistent-dshk-ws-xyz"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 }
