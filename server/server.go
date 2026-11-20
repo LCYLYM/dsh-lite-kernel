@@ -41,8 +41,13 @@ type Server struct {
 	// callers must authenticate whenever it listens beyond loopback.
 	Token string
 
-	mu    sync.Mutex
-	loops map[string]*agent.Loop
+	mu      sync.Mutex
+	loops   map[string]*agent.Loop
+	turnSeq int64
+	// turns maps session id → per-turn token → cancel. Each accepted
+	// message gets its own entry so overlapping turns all cancel, and a
+	// finished turn removes only its own handle.
+	turns map[string]map[int64]context.CancelFunc
 }
 
 const maxBodyBytes = 1 << 20 // uploads are bounded at 1 MiB
@@ -56,6 +61,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}/events", s.streamEvents)
 	mux.HandleFunc("GET /v1/sessions/{id}/history", s.history)
 	mux.HandleFunc("POST /v1/sessions/{id}/notices", s.postNotice)
+	mux.HandleFunc("POST /v1/sessions/{id}/cancel", s.cancelTurn)
 	if s.Token != "" {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Header.Get("Authorization") != "Bearer "+s.Token {
@@ -166,8 +172,29 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "turn already in progress", http.StatusConflict)
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Register before the goroutine starts: a cancel issued between
+	// acceptance and goroutine scheduling must still find the handle.
+	s.mu.Lock()
+	if s.turns == nil {
+		s.turns = map[string]map[int64]context.CancelFunc{}
+	}
+	if s.turns[ses.ID] == nil {
+		s.turns[ses.ID] = map[int64]context.CancelFunc{}
+	}
+	s.turnSeq++
+	tok := s.turnSeq
+	s.turns[ses.ID][tok] = cancel
+	s.mu.Unlock()
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer func() {
+			s.mu.Lock()
+			delete(s.turns[ses.ID], tok)
+			if len(s.turns[ses.ID]) == 0 {
+				delete(s.turns, ses.ID)
+			}
+			s.mu.Unlock()
+		}()
 		defer cancel()
 		defer s.dropLoop(ses.ID)
 		if _, err := loop.Run(ctx, body.Text); err != nil {
@@ -175,6 +202,32 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	writeJSON(w, map[string]any{"queued": true})
+}
+
+// cancelTurn aborts the in-flight turn, if any (upstream #13766 asked
+// for session/cancel in the SDK protocol). A session with no active
+// turn gets 409 — cancelling nothing must not look like success.
+func (s *Server) cancelTurn(w http.ResponseWriter, r *http.Request) {
+	ses, err := s.Store.Get(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.mu.Lock()
+	handles := s.turns[ses.ID]
+	cancels := make([]context.CancelFunc, 0, len(handles))
+	for _, c := range handles {
+		cancels = append(cancels, c)
+	}
+	s.mu.Unlock()
+	if len(cancels) == 0 {
+		http.Error(w, "no active turn", http.StatusConflict)
+		return
+	}
+	for _, c := range cancels {
+		c()
+	}
+	writeJSON(w, map[string]any{"cancelled": len(cancels)})
 }
 
 // postNotice delivers a cross-agent mailbox notice.
